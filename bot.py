@@ -1,104 +1,48 @@
 import os
-import json
-import asyncio
-import logging
-import requests
-from typing import Set
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from aiogram import Bot, Dispatcher, types
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
-# -----------------------------
-# المتغيرات من Environment Variables
-# -----------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME")
+TOKEN = os.getenv("BOT_TOKEN")
 
-TIKTOK_URL = f"https://www.tiktok.com/@{TIKTOK_USERNAME}/live"
-DATA_FILE = "subscribers.json"
-CHECK_INTERVAL = 30  # كل 30 ثانية فحص
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# -----------------------------
-# تحميل المشتركين
-# -----------------------------
-def load_subscribers() -> Set[int]:
-    if not os.path.exists(DATA_FILE):
-        return set()
-    with open(DATA_FILE, "r") as f:
-        return set(json.load(f))
-
-# -----------------------------
-# حفظ المشتركين
-# -----------------------------
-def save_subscribers(subscribers: Set[int]):
-    with open(DATA_FILE, "w") as f:
-        json.dump(list(subscribers), f)
-
-subscribers = load_subscribers()
-
-# -----------------------------
-# أمر Start
-# -----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in subscribers:
-        subscribers.add(user_id)
-        save_subscribers(subscribers)
-    
-    await update.message.reply_text(
-        "أهلاً بك!👌\n"
-        "سيصلك إشعار بمجرد أن يبدأ الدكتور شاكر العاروري بث مباشر على التيك توك."
+@dp.message()
+async def handle_message(message: types.Message):
+    await message.answer(
+        "أهلاً بك في بوت البث المباشر للدكتور شاكر العاروري ❤️🔥\n"
+        "سيتم إعلامك عند بدء البث إن شاء الله!"
     )
 
-# -----------------------------
-# فحص البث
-# -----------------------------
-async def is_live():
-    try:
-        response = requests.get(TIKTOK_URL, timeout=10)
-        return "is_live_broadcast" in response.text
-    except:
-        return False
 
-# -----------------------------
-# وظيفة الفحص المتكرر
-# -----------------------------
-async def live_checker(app):
-    was_live = False
+async def on_startup(app):
+    webhook_url = app['webhook_url']
+    await bot.set_webhook(webhook_url)
 
-    while True:
-        now_live = await asyncio.to_thread(is_live)
+async def on_shutdown(app):
+    await bot.delete_webhook()
+    await bot.session.close()
 
-        if now_live and not was_live:
-            for user_id in subscribers:
-                try:
-                    await app.bot.send_message(
-                        chat_id=user_id,
-                        text="🔴 الدكتور شاكر بدأ البث الآن على التيك توك!"
-                    )
-                except:
-                    pass
 
-        was_live = now_live
-        await asyncio.sleep(CHECK_INTERVAL)
+def main():
+    app = web.Application()
 
-# -----------------------------
-# Main
-# -----------------------------
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # رابط الويب هو رابط الخدمة + /webhook
+    webhook_path = "/webhook"
+    app['webhook_url'] = os.getenv("RENDER_EXTERNAL_URL") + webhook_path
 
-    app.add_handler(CommandHandler("start", start))
+    handler = SimpleRequestHandler(dp, bot)
+    handler.register(app, path=webhook_path)
 
-    asyncio.create_task(live_checker(app))
+    setup_application(app, dp, bot=bot)
 
-    await app.run_polling()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    return app
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(main(), host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
