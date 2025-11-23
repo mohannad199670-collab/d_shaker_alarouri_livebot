@@ -2,176 +2,103 @@ import os
 import json
 import asyncio
 import logging
-from typing import Set
-
 import requests
+from typing import Set
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    ChatMemberHandler,
 )
 
-# ============ إعدادات عامة ============
-# ⚠️ Render يأخذ BOT_TOKEN و TIKTOK_USERNAME من Environment Variables
+# -----------------------------
+# المتغيرات من Environment Variables
+# -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME", "d.shakertawfiqalaroury")
-TIKTOK_URL = f"https://www.tiktok.com/@{TIKTOK_USERNAME}"
+TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME")
 
+TIKTOK_URL = f"https://www.tiktok.com/@{TIKTOK_USERNAME}/live"
 DATA_FILE = "subscribers.json"
-CHECK_INTERVAL = 30  # التحقق كل 30 ثانية
+CHECK_INTERVAL = 30  # كل 30 ثانية فحص
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-subscribers: Set[int] = set()
-last_is_live = False
+# -----------------------------
+# تحميل المشتركين
+# -----------------------------
+def load_subscribers() -> Set[int]:
+    if not os.path.exists(DATA_FILE):
+        return set()
+    with open(DATA_FILE, "r") as f:
+        return set(json.load(f))
 
+# -----------------------------
+# حفظ المشتركين
+# -----------------------------
+def save_subscribers(subscribers: Set[int]):
+    with open(DATA_FILE, "w") as f:
+        json.dump(list(subscribers), f)
 
-# ============ حفظ/قراءة المشتركين ============
-def load_subscribers():
-    global subscribers
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                subscribers = set(data.get("chats", []))
-        except:
-            subscribers = set()
-    else:
-        subscribers = set()
+subscribers = load_subscribers()
 
-
-def save_subscribers():
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump({"chats": list(subscribers)}, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Error saving subscribers: {e}")
-
-
-# ============ أوامر البوت ============
+# -----------------------------
+# أمر Start
+# -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    subscribers.add(chat_id)
-    save_subscribers()
-
-    await update.effective_chat.send_message(
-        "🎥 تم تفعيل تنبيهات البث المباشر.\n"
-        f"سيتم إعلامك عند بدء البث على تيك توك:\nhttps://www.tiktok.com/@{TIKTOK_USERNAME}"
+    user_id = update.effective_user.id
+    if user_id not in subscribers:
+        subscribers.add(user_id)
+        save_subscribers(subscribers)
+    
+    await update.message.reply_text(
+        "أهلاً بك!👌\n"
+        "سيصلك إشعار بمجرد أن يبدأ الدكتور شاكر العاروري بث مباشر على التيك توك."
     )
 
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in subscribers:
-        subscribers.remove(chat_id)
-        save_subscribers()
-        await update.effective_chat.send_message("❌ تم إلغاء تفعيل التنبيهات.")
-    else:
-        await update.effective_chat.send_message("⚠️ أنت غير مشترك أصلاً.")
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(f"📊 عدد المشتركين: {len(subscribers)}")
-
-
-# ============ فحص تيك توك ============
-def check_tiktok_live() -> bool:
+# -----------------------------
+# فحص البث
+# -----------------------------
+async def is_live():
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
-        }
-        resp = requests.get(TIKTOK_URL, headers=headers, timeout=10)
-
-        if resp.status_code != 200:
-            return False
-
-        html = resp.text
-
-        if '"isLive":true' in html or '"liveRoomId"' in html:
-            return True
-
-        return False
-    except Exception as e:
-        logger.error(f"Error checking TikTok: {e}")
+        response = requests.get(TIKTOK_URL, timeout=10)
+        return "is_live_broadcast" in response.text
+    except:
         return False
 
+# -----------------------------
+# وظيفة الفحص المتكرر
+# -----------------------------
+async def live_checker(app):
+    was_live = False
 
-# ============ مهمة التحقق من البث ============
-async def live_checker_job(context: ContextTypes.DEFAULT_TYPE):
-    global last_is_live
+    while True:
+        now_live = await asyncio.to_thread(is_live)
 
-    is_live = await asyncio.get_event_loop().run_in_executor(None, check_tiktok_live)
+        if now_live and not was_live:
+            for user_id in subscribers:
+                try:
+                    await app.bot.send_message(
+                        chat_id=user_id,
+                        text="🔴 الدكتور شاكر بدأ البث الآن على التيك توك!"
+                    )
+                except:
+                    pass
 
-    if is_live and not last_is_live:
-        last_is_live = True
+        was_live = now_live
+        await asyncio.sleep(CHECK_INTERVAL)
 
-        msg = (
-            "🔴 *الدكتور شاكر بدأ بث مباشر الآن!*\n\n"
-            "📲 رابط البث:\n"
-            f"https://www.tiktok.com/@{TIKTOK_USERNAME}/live"
-        )
-
-        for chat_id in list(subscribers):
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=msg, parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Error sending to {chat_id}: {e}")
-
-    elif not is_live and last_is_live:
-        last_is_live = False
-
-
-# ============ عند إضافة البوت لقناة/مجموعة ============
-async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat is None:
-        return
-
-    chat_id = chat.id
-    if chat_id not in subscribers:
-        subscribers.add(chat_id)
-        save_subscribers()
-
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="✅ تم تفعيل تنبيهات البث في القناة.\nلإلغاء التنبيهات: /stop",
-            )
-        except:
-            pass
-
-
-# ============ تشغيل البوت ============
+# -----------------------------
+# Main
+# -----------------------------
 async def main():
-    load_subscribers()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
 
-    # 👈 إصلاح خطأ JobQueue (هذه أهم نقطة)
-    application.job_queue = application.job_queue or application.create_job_queue()
+    asyncio.create_task(live_checker(app))
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stop", stop))
-    application.add_handler(CommandHandler("stats", stats))
-
-    application.add_handler(
-        ChatMemberHandler(chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER)
-    )
-
-    # تشغيل الوظيفة المتكررة
-    application.job_queue.run_repeating(
-        live_checker_job, interval=CHECK_INTERVAL, first=5
-    )
-
-    await application.run_polling()
-
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
