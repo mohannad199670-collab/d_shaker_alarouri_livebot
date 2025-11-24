@@ -1,113 +1,106 @@
 import os
-import aiohttp
-import asyncio
-from aiogram import Bot, Dispatcher, executor, types
-from assemblyai import AssemblyAI
+import logging
+import requests
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
 
-# ============ الإعدادات ============
-
+# ---------------------------
+#     المتغيرات المطلوبة
+# ---------------------------
 TELEGRAM_TOKEN = os.getenv("TOKEN")
-ASSEMBLY_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+ASSEMBLYAI_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("❌ يجب وضع TOKEN في متغيرات البيئة!")
+    raise RuntimeError("❌ مفقود TOKEN في Koyeb")
 
-if not ASSEMBLY_KEY:
-    raise RuntimeError("❌ يجب وضع ASSEMBLYAI_API_KEY في متغيرات البيئة!")
+if not ASSEMBLYAI_KEY:
+    raise RuntimeError("❌ مفقود ASSEMBLYAI_API_KEY في Koyeb")
 
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
+bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(bot)
 
-client = AssemblyAI(api_key=ASSEMBLY_KEY)
+logging.basicConfig(level=logging.INFO)
 
-TMP_DIR = "tmp_audio"
-os.makedirs(TMP_DIR, exist_ok=True)
-
-# ============ دالة التفريغ ============
-
-async def transcribe_audio(file_path: str) -> str:
-    """
-    ترفع الملف لـ AssemblyAI وترجع النص.
-    """
-    # 1) رفع الملف
-    upload_url = client.upload(file_path)
-
-    # 2) إرسال طلب التفريغ
-    transcript = client.transcribe(upload_url)
-
-    # 3) انتظار انتهاء التفريغ
-    transcript = client.wait_for_completion(transcript.id)
-
-    if transcript.status == "completed":
-        return transcript.text
-
-    return "⚠️ لم أستطع استخراج النص من الصوت."
-
-
-# ============ المعالجة الأساسية ============
-
-async def handle_audio(message: types.Message, tg_file):
-    msg = await message.answer("⏳ جاري التفريغ…")
-
-    # حفظ الملف مؤقتاً
-    file_name = f"{message.from_user.id}_{message.message_id}.mp3"
-    file_path = os.path.join(TMP_DIR, file_name)
-
-    try:
-        await tg_file.download(destination=file_path)
-
-        # تنفيذ التفريغ
-        text = await transcribe_audio(file_path)
-
-        await msg.edit_text(
-            f"✅ <b>تفريغ الصوت:</b>\n\n{text}"
+# ---------------------------
+#  دالة رفع الملف لـ AssemblyAI
+# ---------------------------
+def upload_to_assemblyai(file_path: str):
+    headers = {"authorization": ASSEMBLYAI_KEY}
+    with open(file_path, "rb") as f:
+        response = requests.post(
+            "https://api.assemblyai.com/v2/upload",
+            headers=headers,
+            data=f
         )
+    return response.json().get("upload_url")
 
-    except Exception as e:
-        await msg.edit_text("❌ حدث خطأ أثناء التفريغ.")
-        print("TRANSCRIBE ERROR:", e)
+# ---------------------------
+#  دالة بدء التفريغ
+# ---------------------------
+def start_transcription(audio_url: str):
+    endpoint = "https://api.assemblyai.com/v2/transcript"
+    json_data = {"audio_url": audio_url}
+    headers = {"authorization": ASSEMBLYAI_KEY}
+    response = requests.post(endpoint, json=json_data, headers=headers)
+    return response.json().get("id")
 
-    finally:
-        # حذف الملف
-        if os.path.exists(file_path):
-            os.remove(file_path)
+# ---------------------------
+#  دالة جلب النص النهائي
+# ---------------------------
+def get_transcription_result(transcript_id: str):
+    endpoint = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
+    headers = {"authorization": ASSEMBLYAI_KEY}
+    return requests.get(endpoint, headers=headers).json()
 
+# ---------------------------
+# استقبال صوت / فيديو
+# ---------------------------
+@dp.message_handler(content_types=[
+    "voice", "audio", "video", "video_note"
+])
+async def handle_audio(message: types.Message):
 
-# ============ أنواع الرسائل المدعومة ============
+    await message.reply("⏳ جاري معالجة الملف…")
 
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    await message.answer(
-        "👋 مرحباً!\n\n"
-        "🎙️ أرسل لي:\n"
-        "• فويس\n"
-        "• ملف صوتي\n"
-        "• فيديو نوت\n\n"
-        "وسأرجع لك النص مكتوبًا بإذن الله."
-    )
+    # تحميل الملف
+    file_info = await bot.get_file(message.voice.file_id if message.voice else (
+        message.audio.file_id if message.audio else (
+            message.video.file_id if message.video else message.video_note.file_id
+        )
+    ))
 
+    file_path = file_info.file_path
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
-@dp.message_handler(content_types=[types.ContentType.VOICE])
-async def voice_handler(message: types.Message):
-    await handle_audio(message, message.voice)
+    # تحميل الملف مؤقتًا
+    file_data = requests.get(file_url)
+    local_file = "temp_audio_file"
 
+    with open(local_file, "wb") as f:
+        f.write(file_data.content)
 
-@dp.message_handler(content_types=[types.ContentType.AUDIO])
-async def audio_handler(message: types.Message):
-    await handle_audio(message, message.audio)
+    # رفعه إلى AssemblyAI
+    upload_url = upload_to_assemblyai(local_file)
 
+    # بدء التفريغ
+    transcript_id = start_transcription(upload_url)
 
-@dp.message_handler(content_types=[types.ContentType.VIDEO_NOTE])
-async def video_note_handler(message: types.Message):
-    await handle_audio(message, message.video_note)
+    await message.reply("🎙️ جاري التفريغ… قد يستغرق 10–40 ثانية…")
 
+    # الانتظار إلى أن يجهز النص
+    while True:
+        result = get_transcription_result(transcript_id)
+        status = result.get("status")
 
-# ============ تشغيل البوت ============
+        if status == "completed":
+            text = result.get("text", "")
+            return await message.reply(f"📝 التفريغ جاهز:\n\n{text}")
 
-def main():
-    print("🤖 Voice Transcriber Bot is running...")
-    executor.start_polling(dp, skip_updates=True)
+        elif status == "error":
+            return await message.reply("❌ حدث خطأ أثناء التفريغ.")
 
-
+# ---------------------------
+# تشغيل البوت
+# ---------------------------
 if __name__ == "__main__":
-    main()
+    executor.start_polling(dp, skip_updates=True)
