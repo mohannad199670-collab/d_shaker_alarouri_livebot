@@ -1,106 +1,116 @@
 import os
-import logging
 import requests
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
+from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
 
-# ---------------------------
-#     المتغيرات المطلوبة
-# ---------------------------
-TELEGRAM_TOKEN = os.getenv("TOKEN")
-ASSEMBLYAI_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+# ------------------------------
+#  قراءة المتغيّرات من Koyeb
+# ------------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ASSEMBLY_API = os.getenv("ASSEMBLYAI_API_KEY")
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("❌ مفقود TOKEN في Koyeb")
+if not BOT_TOKEN:
+    raise RuntimeError("❌ يجب وضع TELEGRAM_TOKEN في متغيرات البيئة")
 
-if not ASSEMBLYAI_KEY:
-    raise RuntimeError("❌ مفقود ASSEMBLYAI_API_KEY في Koyeb")
+if not ASSEMBLY_API:
+    raise RuntimeError("❌ يجب وضع ASSEMBLYAI_API_KEY في متغيرات البيئة")
 
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(bot)
+# ------------------------------
+#  دالة الترحيب
+# ------------------------------
+def start(update, context):
+    update.message.reply_text(
+        "🎙️ أهلاً بك!\n"
+        "أرسل لي أي *رسالة صوتية* أو *مقطع صوت* أو *فيديو* وسأقوم بتحويله إلى نص مكتوب 📄🔥"
+    )
 
-logging.basicConfig(level=logging.INFO)
+# ------------------------------
+#  تحميل الملف من تليجرام
+# ------------------------------
+def download_file(file_id, bot):
+    file = bot.get_file(file_id)
+    file_path = "audio_input.ogg"
+    file.download(file_path)
+    return file_path
 
-# ---------------------------
-#  دالة رفع الملف لـ AssemblyAI
-# ---------------------------
-def upload_to_assemblyai(file_path: str):
-    headers = {"authorization": ASSEMBLYAI_KEY}
+# ------------------------------
+#  رفع الملف إلى AssemblyAI
+# ------------------------------
+def upload_to_assemblyai(file_path):
+    headers = {"authorization": ASSEMBLY_API}
     with open(file_path, "rb") as f:
         response = requests.post(
             "https://api.assemblyai.com/v2/upload",
             headers=headers,
             data=f
         )
-    return response.json().get("upload_url")
+    return response.json()["upload_url"]
 
-# ---------------------------
-#  دالة بدء التفريغ
-# ---------------------------
-def start_transcription(audio_url: str):
+# ------------------------------
+#  طلب التفريغ من AssemblyAI
+# ------------------------------
+def transcribe_audio(url):
     endpoint = "https://api.assemblyai.com/v2/transcript"
-    json_data = {"audio_url": audio_url}
-    headers = {"authorization": ASSEMBLYAI_KEY}
+    json_data = {"audio_url": url, "language_code": "ar"}
+    headers = {"authorization": ASSEMBLY_API}
+
     response = requests.post(endpoint, json=json_data, headers=headers)
-    return response.json().get("id")
+    transcript_id = response.json()["id"]
 
-# ---------------------------
-#  دالة جلب النص النهائي
-# ---------------------------
-def get_transcription_result(transcript_id: str):
-    endpoint = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
-    headers = {"authorization": ASSEMBLYAI_KEY}
-    return requests.get(endpoint, headers=headers).json()
-
-# ---------------------------
-# استقبال صوت / فيديو
-# ---------------------------
-@dp.message_handler(content_types=[
-    "voice", "audio", "video", "video_note"
-])
-async def handle_audio(message: types.Message):
-
-    await message.reply("⏳ جاري معالجة الملف…")
-
-    # تحميل الملف
-    file_info = await bot.get_file(message.voice.file_id if message.voice else (
-        message.audio.file_id if message.audio else (
-            message.video.file_id if message.video else message.video_note.file_id
-        )
-    ))
-
-    file_path = file_info.file_path
-    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-
-    # تحميل الملف مؤقتًا
-    file_data = requests.get(file_url)
-    local_file = "temp_audio_file"
-
-    with open(local_file, "wb") as f:
-        f.write(file_data.content)
-
-    # رفعه إلى AssemblyAI
-    upload_url = upload_to_assemblyai(local_file)
-
-    # بدء التفريغ
-    transcript_id = start_transcription(upload_url)
-
-    await message.reply("🎙️ جاري التفريغ… قد يستغرق 10–40 ثانية…")
-
-    # الانتظار إلى أن يجهز النص
+    # الانتظار حتى يجهز التفريغ
     while True:
-        result = get_transcription_result(transcript_id)
-        status = result.get("status")
+        status = requests.get(
+            endpoint + "/" + transcript_id,
+            headers=headers
+        ).json()
 
-        if status == "completed":
-            text = result.get("text", "")
-            return await message.reply(f"📝 التفريغ جاهز:\n\n{text}")
+        if status["status"] == "completed":
+            return status["text"]
 
-        elif status == "error":
-            return await message.reply("❌ حدث خطأ أثناء التفريغ.")
+        if status["status"] == "error":
+            return "❌ حدث خطأ أثناء التفريغ."
 
-# ---------------------------
-# تشغيل البوت
-# ---------------------------
+# ------------------------------
+#  استقبال الملفات الصوتية
+# ------------------------------
+def handle_audio(update, context):
+    bot = context.bot
+
+    update.message.reply_text("⏳ جاري التفريغ... انتظر قليلاً 🔥")
+
+    # اختيار نوع الملف
+    file = None
+    if update.message.voice:
+        file = update.message.voice.file_id
+    elif update.message.audio:
+        file = update.message.audio.file_id
+    elif update.message.video_note:
+        file = update.message.video_note.file_id
+    elif update.message.video:
+        file = update.message.video.file_id
+    else:
+        update.message.reply_text("❌ الرجاء إرسال مقطع صوتي أو فيديو.")
+        return
+
+    file_path = download_file(file, bot)
+    audio_url = upload_to_assemblyai(file_path)
+    text = transcribe_audio(audio_url)
+
+    update.message.reply_text("📄 *النص المستخرج:*\n\n" + text)
+
+
+# ------------------------------
+#  تشغيل البوت
+# ------------------------------
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.all, handle_audio))
+
+    updater.start_polling()
+    updater.idle()
+
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    main()
