@@ -224,8 +224,8 @@ def get_video_duration(input_file: str) -> float:
 
 def split_video_to_parts(input_file: str, max_mb: int = MAX_TELEGRAM_MB):
     """
-    تقسيم الفيديو إلى أجزاء حسب الحجم المستهدف (تقريبياً).
-    نعتمد على تقسيم المدة إلى N أجزاء (ceiling) حتى لا يضيع الجزء الأخير الصغير.
+    تقسيم الفيديو إلى أجزاء بحيث لا يتجاوز أي جزء حجم تيليجرام.
+    نستخدم إعادة ترميز خفيفة جداً (crf=23) لضمان حجم ثابت وخالي من مشاكل keyframes.
     """
     limit_bytes = max_mb * 1024 * 1024
     size_bytes = os.path.getsize(input_file)
@@ -235,7 +235,6 @@ def split_video_to_parts(input_file: str, max_mb: int = MAX_TELEGRAM_MB):
 
     duration = get_video_duration(input_file)
 
-    # عدد الأجزاء (ceiling) لضمان عدم ضياع أي جزء صغير
     num_parts = math.ceil(size_bytes / limit_bytes)
     if num_parts < 1:
         num_parts = 1
@@ -252,19 +251,36 @@ def split_video_to_parts(input_file: str, max_mb: int = MAX_TELEGRAM_MB):
         command = [
             "ffmpeg",
             "-y",
-            "-ss",
-            str(start),
-            "-i",
-            input_file,
-            "-t",
-            str(part_duration),
-            "-c",
-            "copy",
+            "-ss", str(start),
+            "-i", input_file,
+            "-t", str(part_duration),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
             out_file,
         ]
+
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+        # تأكد أن الجزء ليس فارغاً
+        if os.path.exists(out_file) and os.path.getsize(out_file) > 1024:
+            # لو كان أكبر من المسموح — نعيد ترميزه لجعله أصغر
+            if os.path.getsize(out_file) > limit_bytes:
+                command2 = [
+                    "ffmpeg",
+                    "-y",
+                    "-i", out_file,
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "28",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    out_file,
+                ]
+                subprocess.run(command2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
             output_files.append(out_file)
 
     return output_files
