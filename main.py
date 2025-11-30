@@ -26,12 +26,11 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ================= إعداد الكوكيز =================
-# متغير البيئة الذي تضع فيه هيدر الكوكيز الكامل:
-# مثال: SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...
-YT_COOKIES_HEADER = os.getenv("YT_COOKIES_HEADER", os.getenv("YT_COOKIES", "")).strip()
-
-# إلغاء استخدام ملف cookies.txt نهائياً
-COOKIES_PATH = None
+# الآن الاعتماد على ملف cookies.txt الموجود في نفس مجلد main.py
+COOKIES_PATH = "cookies.txt"
+if not os.path.exists(COOKIES_PATH):
+    logger.warning("⚠️ ملف cookies.txt غير موجود، قد تفشل بعض الفيديوهات المحمية أو الطويلة.")
+    COOKIES_PATH = None  # حتى لا نعطي yt-dlp مسار غير موجود
 
 # ================= إعدادات الحجم =================
 MAX_TELEGRAM_MB = 48  # الحد المستهدف لكل جزء (تقريباً 48 ميغا)
@@ -47,7 +46,8 @@ MAX_TELEGRAM_MB = 48  # الحد المستهدف لكل جزء (تقريباً 
 #       "start": 10,
 #       "end": 120,
 #       "duration": 110,
-#       "quality_height": 360
+#       "quality_height": 360,
+#       "available_heights": [144, 360, 720]
 #   }
 # }
 user_sessions = {}
@@ -62,7 +62,9 @@ def reset_session(chat_id: int):
 
 # ================= دوال مساعدة =================
 def extract_url(text: str) -> str:
-    """يأخذ أول جزء يبدو كرابط من النص."""
+    """
+    يلتقط أول شيء يشبه الرابط من الرسالة (في حال أرسل نص + رابط).
+    """
     parts = text.split()
     for p in parts:
         if "http" in p or "youtu" in p:
@@ -106,11 +108,9 @@ def get_available_qualities(video_url: str):
         "geo_bypass": True,
     }
 
-    # استخدام الكوكيز من الهيدر إذا موجودة
-    if YT_COOKIES_HEADER:
-        ydl_opts["http_headers"] = {
-            "Cookie": YT_COOKIES_HEADER
-        }
+    # استخدام ملف الكوكيز إذا متوفر
+    if COOKIES_PATH:
+        ydl_opts["cookies"] = COOKIES_PATH
 
     target_heights = {144, 240, 360, 480, 720, 1080}
     available = set()
@@ -171,10 +171,9 @@ def download_video(video_url: str, quality_height: int | None, output_name: str 
         "merge_output_format": "mp4",
     }
 
-    if YT_COOKIES_HEADER:
-        ydl_opts["http_headers"] = {
-            "Cookie": YT_COOKIES_HEADER
-        }
+    # استخدام cookies.txt لو متوفر
+    if COOKIES_PATH:
+        ydl_opts["cookies"] = COOKIES_PATH
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
@@ -569,7 +568,7 @@ def start_cutting(chat_id: int):
         bot.send_message(
             chat_id,
             "❌ حدث خطأ أثناء تحميل الفيديو من يوتيوب.\n"
-            "تأكد أن رابط الفيديو يعمل، وأن متغير الكوكيز <b>YT_COOKIES_HEADER</b> (أو YT_COOKIES) صحيح ومحدث."
+            "تأكد أن رابط الفيديو يعمل، وأن ملف <b>cookies.txt</b> صحيح ومحدّث."
         )
     except Exception as e:
         logger.error("Unexpected error in start_cutting", exc_info=e)
