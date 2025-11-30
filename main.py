@@ -1,78 +1,78 @@
 import telebot
-import yt_dlp
 import subprocess
+import yt_dlp
 import os
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = "ضع_توكن_البوت_هنا"
 bot = telebot.TeleBot(BOT_TOKEN)
 
-user_steps = {}
-
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "🎬 أرسل رابط فيديو يوتيوب أو تيك توك لقصّه.")
-
-@bot.message_handler(func=lambda m: True)
-def handle_url(message):
-    chat_id = message.chat.id
-    text = message.text
-
-    if chat_id not in user_steps:
-        if "youtube.com" in text or "youtu.be" in text or "tiktok.com" in text:
-            user_steps[chat_id] = {"url": text}
-            bot.send_message(chat_id, "⏱️ أرسل **وقت البداية** (مثال 00:10)")
-        return
-
-    if "start" not in user_steps[chat_id]:
-        user_steps[chat_id]["start"] = text
-        bot.send_message(chat_id, "⏱️ أرسل **وقت النهاية** (مثال 00:20)")
-        return
-
-    if "end" not in user_steps[chat_id]:
-        user_steps[chat_id]["end"] = text
-        bot.send_message(chat_id, "⏳ جاري القص…")
-
-        url = user_steps[chat_id]["url"]
-        start_t = user_steps[chat_id]["start"]
-        end_t = user_steps[chat_id]["end"]
-
-        download_video(chat_id, url, start_t, end_t)
-        del user_steps[chat_id]
-
-
-def download_video(chat_id, url, start_t, end_t):
-    output = "video.mp4"
-    cut = "cut.mp4"
-
-    bot.send_message(chat_id, "⬇️ جاري تنزيل الفيديو…")
-
+def get_stream_url(video_url):
     ydl_opts = {
-        "format": "mp4",
-        "outtmpl": output
+        "format": "best",
+        "quiet": True,
+        "noplaylist": True,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except:
-        bot.send_message(chat_id, "❌ فشل التحميل")
-        return
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+        return info["url"]  # رابط الستريم الحقيقي
 
-    bot.send_message(chat_id, "✂️ جاري القص…")
 
-    cmd = [
-        "ffmpeg", "-i", output, "-ss", start_t, "-to", end_t,
-        "-c", "copy", cut
+def cut_video_stream(stream_url, start_time, duration):
+    output_file = "cut.mp4"
+
+    # قص مباشر دون تحميل كامل
+    command = [
+        "ffmpeg",
+        "-ss", start_time,
+        "-i", stream_url,
+        "-t", duration,
+        "-c", "copy",
+        "-y",
+        output_file
     ]
 
+    subprocess.run(command)
+    return output_file
+
+
+@bot.message_handler(commands=['cut'])
+def start_cut(message):
+    bot.reply_to(message, "📹 أرسل رابط الفيديو الآن:")
+    bot.register_next_step_handler(message, get_url)
+
+
+def get_url(message):
+    url = message.text.strip()
+    bot.reply_to(message, "⏳ أرسل وقت البداية بصيغة:\n00:01:30")
+    bot.register_next_step_handler(message, get_start, url)
+
+
+def get_start(message, url):
+    start = message.text.strip()
+    bot.reply_to(message, "⏳ أرسل المدة المطلوبة بصيغة:\n00:05:00")
+    bot.register_next_step_handler(message, process_cut, url, start)
+
+
+def process_cut(message, url, start):
+    duration = message.text.strip()
+
     try:
-        subprocess.run(cmd, check=True)
-        bot.send_video(chat_id, open(cut, "rb"))
-    except:
-        bot.send_message(chat_id, "❌ فشل القص")
+        bot.reply_to(message, "🎬 جاري تجهيز رابط البث…")
+        stream = get_stream_url(url)
 
-    os.remove(output)
-    os.remove(cut)
+        bot.reply_to(message, "✂️ جاري القص… انتظر قليلاً")
+
+        output = cut_video_stream(stream, start, duration)
+
+        with open(output, "rb") as video:
+            bot.send_video(message.chat.id, video)
+
+        os.remove(output)
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطأ: {e}")
 
 
+print("🔥 Bot is running…")
 bot.polling()
