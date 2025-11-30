@@ -1,5 +1,3 @@
 pytelegrambotapi
 yt-dlp
-pydub
-google-cloud-speech
-requests
+ffmpeg-python
