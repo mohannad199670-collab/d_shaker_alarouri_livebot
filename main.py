@@ -1,63 +1,44 @@
 import os
 import math
 import time
+import logging
 import subprocess
 
-import yt_dlp
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
+
+from yt_dlp import YoutubeDL
+
+# ================= إعداد اللوج =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 # ================= إعداد التوكن =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN غير موجود في Environment variables")
 
-# متغير الكوكيز من Koyeb (يوضع كما هو من ملف cookies.txt)
-YT_COOKIES_ENV = os.getenv("YT_COOKIES", "").strip()
-
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# جلسات المستخدمين لحفظ الحالة
-# user_sessions = {
-#   chat_id: {
-#       "step": "wait_url" | "wait_start" | "wait_end" | "quality",
-#       "url": str,
-#       "start": int,
-#       "end": int,
-#       "duration": int,
-#       "formats": {height: format_id},
-#       "chosen_height": int,
-#       "format_id": str,
-#   }
-# }
-user_sessions = {}
+# ================= إعداد الكوكيز =================
+# نقرأ الكوكيز من متغير البيئة:
+# YT_COOKIES_HEADER أو YT_COOKIES (احتياطاً لو استخدمت الاسم القديم)
+YT_COOKIES_HEADER = os.getenv("YT_COOKIES_HEADER", os.getenv("YT_COOKIES", "")).strip()
 
-# حد الحجم لكل جزء (48 ميغا)
-MAX_CHUNK_MB = 48
-MAX_CHUNK_BYTES = MAX_CHUNK_MB * 1024 * 1024
+# إلغاء استخدام ملف cookies.txt نهائياً
+COOKIES_PATH = None
 
+# ================= إعدادات الحجم =================
+# الحد الأقصى لكل جزء (حتى لا نضرب حد تليجرام 50MB)
+MAX_MB_PER_PART = 48
 
-# ========= دالة مساعدة: كتابة الكوكيز من المتغيّر إلى ملف =========
-def ensure_cookies_file() -> str | None:
-    """
-    إذا كان متغير YT_COOKIES غير فارغ، يكتب محتواه في cookies.txt
-    ويعيد مسار الملف. وإلا يعيد None.
-    """
-    if not YT_COOKIES_ENV:
-        return None
-
-    cookies_path = os.path.join(os.getcwd(), "cookies.txt")
-    try:
-        with open(cookies_path, "w", encoding="utf-8") as f:
-            f.write(YT_COOKIES_ENV)
-        return cookies_path
-    except Exception as e:
-        print("Error writing cookies file:", e)
-        return None
-
-
-COOKIES_PATH = ensure_cookies_file()
+# ================= جلسات المستخدمين =================
+# نخزن حالة كل مستخدم:
+# state: awaiting_url / awaiting_start / awaiting_end / awaiting_quality / processing
+user_sessions = {}  # {chat_id: {...}}
 
 
 # ========= دالة مساعدة: تحويل الوقت إلى ثواني =========
@@ -84,50 +65,56 @@ def parse_time_to_seconds(time_str: str) -> int:
         raise ValueError("صيغة وقت غير مدعومة")
 
 
+def reset_session(chat_id: int):
+    user_sessions[chat_id] = {
+        "state": "awaiting_url"
+    }
+
+
 # ========= دالة: جلب الجودات المتاحة =========
 def get_available_qualities(video_url: str):
     """
-    يرجع dict مثل: {144: "18", 360: "18", 480: "135", ...}
-    يختار فقط الفورمات التي تحتوي فيديو + صوت (acodec != none, vcodec != none)
+    يرجع dict مثل: {144: "91", 360: "18", 480: "94", ...}
+    حسب الجودات الموجودة فعلاً في الفيديو
     """
+    # إعدادات yt-dlp لفحص الجودات فقط دون تحميل
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "geo_bypass": True,
-        # استخدام الكوكيز إن وجدت
-        "cookiefile": COOKIES_PATH if COOKIES_PATH else None,
-        # تقليل مشاكل SABR
+
+        # **التعديل هنا: استخدام الكوكيز كـ HTTP Header**
+        "http_headers": {
+            "Cookie": YT_COOKIES_HEADER
+        } if YT_COOKIES_HEADER else None,
+
+        # استخدام عميل أندرويد لتقليل مشاكل YouTube
         "extractor_args": {
             "youtube": {
-                "player_client": ["default"]
+                "player_client": ["android"]
             }
-        },
+        }
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         formats = info.get("formats", [])
 
     target_heights = [144, 240, 360, 480, 720, 1080]
-    result: dict[int, str] = {}
+    result = {}
 
     for f in formats:
         height = f.get("height")
         fmt_id = f.get("format_id")
         vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        ext = f.get("ext")
-
-        # نتأكد أنه يحتوي صوت وفيديو (وليس صوت فقط أو فيديو فقط)
         if not height or not fmt_id:
             continue
-        if vcodec == "none" or acodec == "none":
-            continue
-        if ext not in ("mp4", "webm"):
+        # نتأكد أنه ليس صوت فقط
+        if vcodec == "none":
             continue
         if height in target_heights:
-            # نخزن آخر فورمات لكل ارتفاع (عادة يكون أفضل)
+            # آخر واحد غالباً أحدث/أفضل لنفس الارتفاع
             result[height] = fmt_id
 
     return result
@@ -136,14 +123,14 @@ def get_available_qualities(video_url: str):
 # ========= دالة: تحميل الفيديو بالجودة المطلوبة =========
 def download_video(video_url: str, format_id: str | None, output_name: str = "source") -> str:
     """
-    يقوم بتحميل الفيديو من يوتيوب بالجودة المحددة (format_id إذا موجود)
-    وإلا يستخدم best.
-    يعيد اسم الملف الناتج.
+    يقوم بتحميل الفيديو من يوتيوب بالجودة المحددة
+    ويعيد اسم الملف الناتج
     """
     if format_id:
         fmt = format_id
     else:
-        fmt = "best"
+        # في حال لم نختر جودة معينة نستخدم أفضل جودة متاحة
+        fmt = "bestvideo*+bestaudio/best"
 
     ydl_opts = {
         "format": fmt,
@@ -151,26 +138,30 @@ def download_video(video_url: str, format_id: str | None, output_name: str = "so
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
-        "cookiefile": COOKIES_PATH if COOKIES_PATH else None,
+
+        # **التعديل هنا: استخدام الكوكيز كـ HTTP Header**
+        "http_headers": {
+            "Cookie": YT_COOKIES_HEADER
+        } if YT_COOKIES_HEADER else None,
+
         "extractor_args": {
             "youtube": {
-                "player_client": ["default"]
+                "player_client": ["android"]
             }
-        },
+        }
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         filename = ydl.prepare_filename(info)
 
     return filename
 
 
-# ========= دالة: قص الفيديو =========
-def cut_video(input_file: str, start_seconds: int, duration_seconds: int, output_file: str = "cut.mp4") -> str:
+# ========= دالة: قص الفيديو باستخدام ffmpeg =========
+def cut_video(input_file: str, start_seconds: int, duration_seconds: int, output_file: str = "cut_full.mp4"):
     """
-    يقص جزء من الفيديو مع إعادة ترميز إلى H.264 + AAC
-    حتى نضمن توافق الصوت والفيديو مع تيليجرام.
+    يقص جزء من الفيديو بدون إعادة ترميز (copy) لسرعة أعلى
     """
     command = [
         "ffmpeg",
@@ -181,16 +172,8 @@ def cut_video(input_file: str, start_seconds: int, duration_seconds: int, output
         input_file,
         "-t",
         str(duration_seconds),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
+        "-c",
+        "copy",
         output_file,
     ]
 
@@ -198,133 +181,166 @@ def cut_video(input_file: str, start_seconds: int, duration_seconds: int, output
     return output_file
 
 
-# ========= دالة: معرفة مدة الفيديو بالثواني =========
-def get_video_duration(input_file: str) -> float | None:
-    try:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=nk=1:nw=1",
-            input_file,
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            return None
-        return float(res.stdout.strip())
-    except Exception as e:
-        print("Error getting duration:", e)
-        return None
-
-
-# ========= دالة: تقسيم الفيديو إلى أجزاء حسب الحجم =========
-def split_video_by_size(input_file: str, max_size_bytes: int = MAX_CHUNK_BYTES) -> list[str]:
+# ========= دالة: تقسيم الفيديو حسب الحجم =========
+def split_video_by_size(input_file: str, duration_seconds: int, max_mb: int = MAX_MB_PER_PART):
     """
-    يقسم الفيديو إلى عدة ملفات بحيث لا يتجاوز كل واحد الحجم المحدد.
-    القِيَم تقريبية حسب المدة، لكنها تضمن عدم تجاهل الجزء الأخير الصغير.
+    تقسيم الفيديو إلى عدة ملفات بحيث يكون حجم كل ملف تقريباً <= max_mb
+    نقسم حسب الزمن بالتساوي تقريباً
     """
-    size = os.path.getsize(input_file)
-    if size <= max_size_bytes:
+    size_bytes = os.path.getsize(input_file)
+    size_mb = size_bytes / (1024 * 1024)
+
+    if size_mb <= max_mb:
+        # لا حاجة للتقسيم
         return [input_file]
 
-    duration = get_video_duration(input_file)
-    if not duration or duration <= 0:
-        # لا نعرف المدة، نرجع الملف كما هو
-        return [input_file]
+    parts = math.ceil(size_mb / max_mb)
+    # نتأكد أن مدة كل جزء على الأقل 1 ثانية
+    base_chunk = max(1, duration_seconds // parts)
 
-    # عدد الأجزاء المطلوب (مثلاً إذا كان 100MB والحد 48 => parts = 3)
-    parts = math.ceil(size / max_size_bytes)
-    part_duration = duration / parts
-
-    print(f"Splitting video: size={size} bytes, duration={duration}s, parts={parts}")
-
-    part_files: list[str] = []
+    chunk_files = []
     for i in range(parts):
-        start = i * part_duration
-        part_name = f"part_{i+1}.mp4"
-
+        start = i * base_chunk
         if i == parts - 1:
-            # الجزء الأخير: حتى نهاية الفيديو
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                str(start),
-                "-i",
-                input_file,
-                "-c:v",
-                "copy",
-                "-c:a",
-                "copy",
-                part_name,
-            ]
+            # آخر جزء يأخذ كل المتبقي
+            this_duration = duration_seconds - start
         else:
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                str(start),
-                "-i",
-                input_file,
-                "-t",
-                str(part_duration),
-                "-c:v",
-                "copy",
-                "-c:a",
-                "copy",
-                part_name,
-            ]
+            this_duration = base_chunk
 
+        if this_duration <= 0:
+            continue
+
+        out_name = f"part_{i + 1}.mp4"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start),
+            "-i",
+            input_file,
+            "-t",
+            str(this_duration),
+            "-c",
+            "copy",
+            out_name,
+        ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # نتأكد من أن الملف تم إنشاؤه
-        if os.path.exists(part_name) and os.path.getsize(part_name) > 0:
-            part_files.append(part_name)
+        chunk_files.append(out_name)
 
-    # لو لسبب ما لم ينتج أي جزء، نرجع الملف الأصلي
-    if not part_files:
-        part_files.append(input_file)
-
-    return part_files
+    return chunk_files
 
 
-# ========= /start =========
+# ========= تنفيذ القص والتقسيم والإرسال =========
+def process_video(chat_id: int):
+    session = user_sessions.get(chat_id)
+    if not session:
+        bot.send_message(chat_id, "⚠️ حصل خطأ في الجلسة. أرسل /start من جديد.")
+        return
+
+    url = session.get("url")
+    start_seconds = session.get("start")
+    duration = session.get("duration")
+    format_id = session.get("format_id")
+
+    if not url or start_seconds is None or duration is None:
+        bot.send_message(chat_id, "⚠️ بيانات غير مكتملة. أرسل /start من جديد.")
+        reset_session(chat_id)
+        return
+
+    bot.send_message(
+        chat_id,
+        "🔧 جاري قصّ المقطع وتحضيره…\n"
+        "قد يستغرق ذلك بعض الوقت حسب طول المقطع والجودة."
+    )
+
+    input_file = None
+    cut_file = "cut_full.mp4"
+    chunk_files = []
+
+    try:
+        # تحميل الفيديو
+        input_file = download_video(url, format_id, output_name="source")
+        # قص الجزء المطلوب
+        cut_video(input_file, start_seconds, duration, cut_file)
+        # تقسيم حسب الحجم
+        chunk_files = split_video_by_size(cut_file, duration, MAX_MB_PER_PART)
+
+        total_parts = len(chunk_files)
+
+        for idx, path in enumerate(chunk_files, start=1):
+            bot.send_message(chat_id, f"📤 جاري إرسال الجزء {idx} من {total_parts}…")
+            with open(path, "rb") as f:
+                bot.send_video(
+                    chat_id,
+                    f,
+                    supports_streaming=True,
+                    caption=f"🎬 الجزء {idx}/{total_parts}"
+                )
+
+        bot.send_message(chat_id, "✅ انتهى! يمكنك الآن إرسال رابط يوتيوب جديد مباشرة.")
+        reset_session(chat_id)
+
+    except ApiTelegramException as e:
+        logging.exception("Telegram API error while sending video")
+        if "413" in str(e) or "Request Entity Too Large" in str(e):
+            bot.send_message(
+                chat_id,
+                "❌ ما زال أحد المقاطع أكبر من الحد المسموح في تلجرام حتى بعد التقسيم.\n"
+                "حاول اختيار جودة أقل أو تقليل مدة القص."
+            )
+        else:
+            bot.send_message(chat_id, f"❌ خطأ من تلجرام أثناء الإرسال:\n<code>{e}</code>")
+    except Exception as e:
+        logging.exception("Error in process_video")
+        bot.send_message(chat_id, "❌ حدث خطأ غير متوقع أثناء تحميل أو قص الفيديو.")
+    finally:
+        # تنظيف الملفات المؤقتة
+        try:
+            if input_file and os.path.exists(input_file):
+                os.remove(input_file)
+            if os.path.exists(cut_file):
+                os.remove(cut_file)
+            for p in chunk_files:
+                if p and os.path.exists(p):
+                    os.remove(p)
+        except Exception:
+            pass
+
+
+# ========= أوامر البوت =========
 @bot.message_handler(commands=["start"])
-def start(message):
+def cmd_start(message):
     chat_id = message.chat.id
-    user_sessions[chat_id] = {"step": "wait_url"}
-
+    reset_session(chat_id)
     bot.reply_to(
         message,
-        "👋 أهلاً بك في بوت <b>قص فيديوهات من يوتيوب</b>\n\n"
-        "أرسل الآن رابط فيديو يوتيوب (بث محفوظ أو فيديو عادي)."
+        "👋 أهلاً بك في بوت <b>قص فيديوهات يوتيوب</b>\n\n"
+        "📎 أرسل الآن رابط فيديو يوتيوب (عادي أو بث محفوظ)،\n"
+        "وسأطلب منك وقت البداية والنهاية ثم الجودة."
     )
 
 
-# ========= /cancel =========
-@bot.message_handler(commands=["cancel"])
-def cancel(message):
-    chat_id = message.chat.id
-    user_sessions.pop(chat_id, None)
-    bot.reply_to(message, "✅ تم إلغاء العملية الحالية.\nأرسل رابط جديد أو الأمر /start للبدء من جديد.")
-
-
-# ========= هاندلر واحد لكل الرسائل النصية =========
+# ========= التعامل مع أي رسالة نصية =========
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
 
-    # لو كانت الرسالة رابط (يبدأ بـ http) نبدأ جلسة جديدة مباشرة
-    if text.startswith("http://") or text.startswith("https://"):
-        user_sessions[chat_id] = {
-            "step": "wait_start",
-            "url": text,
-        }
+    # تجاهل الأوامر الأخرى (مثل /start تمت معالجتها)
+    if text.startswith("/"):
+        return
+
+    # إن لم يوجد جلسة، نجهز واحدة
+    if chat_id not in user_sessions:
+        reset_session(chat_id)
+
+    session = user_sessions[chat_id]
+    state = session.get("state", "awaiting_url")
+
+    # إذا أرسل رابط يوتيوب جديد في أي وقت نبدأ من الصفر
+    if ("youtube.com" in text) or ("youtu.be" in text):
+        session["url"] = text
+        session["state"] = "awaiting_start"
         bot.reply_to(
             message,
             "⏱️ أرسل وقت البداية بصيغة مثل:\n"
@@ -332,42 +348,31 @@ def handle_text(message):
         )
         return
 
-    # غير رابط -> نكمل حسب المرحلة
-    session = user_sessions.get(chat_id)
-    if not session:
-        bot.reply_to(message, "⚠️ أرسل أولاً رابط يوتيوب أو الأمر /start للبدء.")
-        return
-
-    step = session.get("step")
-
-    # ===== مرحلة انتظار وقت البداية =====
-    if step == "wait_start":
+    # لو ليس رابط يوتيوب، نحدد حسب الحالة الحالية
+    if state == "awaiting_start":
         try:
             start_seconds = parse_time_to_seconds(text)
         except ValueError:
-            bot.reply_to(message, "⚠️ صيغة وقت غير صحيحة. أعد إرسال وقت البداية بشكل صحيح.")
+            bot.reply_to(message, "⚠️ صيغة وقت البداية غير صحيحة. أعد الإرسال.")
             return
 
         session["start"] = start_seconds
-        session["step"] = "wait_end"
-
+        session["state"] = "awaiting_end"
         bot.reply_to(
             message,
             "⏱️ الآن أرسل وقت النهاية.\n"
             "مثال: <code>00:05:00</code> يعني بعد 5 دقائق من بداية الفيديو."
         )
-        return
 
-    # ===== مرحلة انتظار وقت النهاية =====
-    if step == "wait_end":
+    elif state == "awaiting_end":
         try:
             end_seconds = parse_time_to_seconds(text)
         except ValueError:
-            bot.reply_to(message, "⚠️ صيغة وقت غير صحيحة. أعد إرسال وقت النهاية بشكل صحيح.")
+            bot.reply_to(message, "⚠️ صيغة وقت النهاية غير صحيحة. أعد الإرسال.")
             return
 
-        start_seconds = session["start"]
-        if end_seconds <= start_seconds:
+        start_seconds = session.get("start")
+        if start_seconds is None or end_seconds <= start_seconds:
             bot.reply_to(message, "⚠️ يجب أن يكون وقت النهاية أكبر من وقت البداية. أعد الإرسال.")
             return
 
@@ -375,35 +380,34 @@ def handle_text(message):
         session["end"] = end_seconds
         session["duration"] = duration
 
-        bot.reply_to(message, "⏳ يتم فحص الجودات المتاحة للفيديو… الرجاء الانتظار.")
+        bot.reply_to(message, "⏳ يتم فحص الجودات المتاحة للفيديو… الرجاء الانتظار قليلاً.")
+        video_url = session.get("url")
 
-        # الآن نأخذ الجودات
         try:
-            qualities = get_available_qualities(session["url"])
+            qualities = get_available_qualities(video_url)
         except Exception as e:
-            print("Error getting qualities:", e)
+            logging.exception("Error getting qualities from YouTube")
             bot.reply_to(
                 message,
                 "❌ حدث خطأ أثناء فحص الجودات من يوتيوب.\n"
-                "قد يكون هناك مشكلة في الاتصال أو في الكوكيز.\n"
-                "تأكد أن متغير <code>YT_COOKIES</code> يحتوي على قيمة صحيحة من ملف cookies.txt."
+                "قد يكون هناك مشكلة في الاتصال أو في الكوكيز."
             )
-            session["step"] = None
             return
 
         if not qualities:
-            bot.reply_to(
-                message,
+            bot.send_message(
+                chat_id,
                 "⚠️ لم يتم العثور على جودات قياسية (144p–1080p).\n"
                 "سيتم استخدام أفضل جودة متاحة تلقائياً."
             )
-            session["format_id"] = None  # best
-            session["step"] = "ready"
-            start_cutting(chat_id)
+            session["format_id"] = None
+            session["state"] = "processing"
+            process_video(chat_id)
             return
 
+        # حفظ الجودات في الجلسة
         session["formats"] = qualities
-        session["step"] = "quality"
+        session["state"] = "awaiting_quality"
 
         # إنشاء أزرار الجودات المتاحة فقط
         markup = InlineKeyboardMarkup()
@@ -423,15 +427,14 @@ def handle_text(message):
             "🎚️ <b>اختر الجودة</b> من الأزرار بالأسفل:",
             reply_markup=markup
         )
-        return
 
-    # لو كان في مرحلة اختيار الجودة والرسالة ليست من الأزرار
-    if step == "quality":
-        bot.reply_to(message, "⬇️ الرجاء اختيار الجودة من الأزرار الموجودة في الرسالة السابقة.")
-        return
-
-    # أي شيء آخر
-    bot.reply_to(message, "⚠️ لم أفهم الرسالة.\nأرسل رابط يوتيوب جديد أو استخدم /cancel لإلغاء العملية.")
+    else:
+        # أي نص آخر في حالة مختلفة
+        bot.reply_to(
+            message,
+            "📎 أرسل رابط يوتيوب لبدء قص مقطع جديد،\n"
+            "أو استخدم الأمر /start لإعادة التشغيل."
+        )
 
 
 # ========= التعامل مع ضغط زر الجودة =========
@@ -439,8 +442,13 @@ def handle_text(message):
 def handle_quality_callback(call):
     chat_id = call.message.chat.id
     session = user_sessions.get(chat_id)
+
     if not session:
-        bot.answer_callback_query(call.id, "انتهت الجلسة. أرسل رابط جديد.", show_alert=True)
+        bot.answer_callback_query(call.id, "انتهت الجلسة. أرسل /start من جديد.", show_alert=True)
+        return
+
+    if session.get("state") != "awaiting_quality":
+        bot.answer_callback_query(call.id, "لا يوجد اختيار جودة مطلوب حالياً.", show_alert=True)
         return
 
     try:
@@ -454,107 +462,32 @@ def handle_quality_callback(call):
         bot.answer_callback_query(call.id, "هذه الجودة غير متاحة.", show_alert=True)
         return
 
-    session["chosen_height"] = height
     session["format_id"] = fmt_id
-    session["step"] = "ready"
+    session["state"] = "processing"
 
     bot.answer_callback_query(call.id, f"تم اختيار الجودة: {height}p ✅", show_alert=False)
     bot.edit_message_text(
         f"✅ تم اختيار الجودة: <b>{height}p</b>\n"
-        "سيتم الآن قصّ المقطع وتقسيمه (إن لزم) وإرساله كفيديو…",
+        "سيتم الآن قصّ المقطع وتقسيمه وإرساله…",
         chat_id=chat_id,
         message_id=call.message.message_id
     )
 
-    # بدء عملية القص والإرسال
-    start_cutting(chat_id)
+    process_video(chat_id)
 
 
-# ========= تنفيذ القص + التقسيم + الإرسال =========
-def start_cutting(chat_id: int):
-    session = user_sessions.get(chat_id)
-    if not session:
-        bot.send_message(chat_id, "⚠️ حصل خطأ في الجلسة. أرسل رابط جديد.")
-        return
-
-    url = session["url"]
-    start_seconds = session["start"]
-    duration = session["duration"]
-    format_id = session.get("format_id")  # قد تكون None => best
-
-    bot.send_message(
-        chat_id,
-        "🔧 جاري القص… الرجاء الانتظار قليلاً.\n"
-        "قد يستغرق ذلك وقتاً حسب طول المقطع والجودة."
-    )
-
-    input_file = None
-    cut_file = "cut.mp4"
-    part_files: list[str] = []
-
-    try:
-        # تحميل الفيديو بالجودة المحددة
-        input_file = download_video(url, format_id, output_name="source")
-
-        # قص الفيديو
-        cut_video(input_file, start_seconds, duration, cut_file)
-
-        # تقسيم حسب الحجم (48MB)
-        part_files = split_video_by_size(cut_file, MAX_CHUNK_BYTES)
-
-        # إشعار قبل الإرسال
-        bot.send_message(chat_id, "📤 جاري إرسال الفيديو كفيديو (مع الصوت)… الرجاء الانتظار.")
-
-        # إرسال كل جزء كـ Video
-        for idx, part in enumerate(part_files, start=1):
-            caption = f"✅ المقطع جاهز 🎬\nالجزء {idx} / {len(part_files)}" if len(part_files) > 1 else "✅ المقطع جاهز 🎬"
-            with open(part, "rb") as f:
-                bot.send_video(chat_id, f, caption=caption)
-
-        bot.send_message(chat_id, "✅ انتهى! يمكنك الآن إرسال رابط جديد مباشرة لقص مقطع آخر.")
-        # نضبط الخطوة لانتظار رابط جديد
-        session["step"] = "wait_url"
-
-    except ApiTelegramException as e:
-        # حجم كبير جداً بالنسبة لحد تيليجرام (نادر لأننا قسمنا، لكن للاحتياط)
-        if "413" in str(e) or "Request Entity Too Large" in str(e):
-            bot.send_message(
-                chat_id,
-                "❌ ما زال حجم أحد الأجزاء أكبر من المسموح في تيليجرام.\n"
-                "حاول اختيار جودة أقل أو قص مدة أقصر."
-            )
-        else:
-            bot.send_message(chat_id, f"❌ خطأ من تيليجرام أثناء الإرسال:\n<code>{e}</code>")
-    except yt_dlp.utils.DownloadError as e:
-        print("DownloadError:", e)
-        bot.send_message(
-            chat_id,
-            "❌ حدث خطأ أثناء تحميل الفيديو من يوتيوب.\n"
-            "تأكد أن رابط الفيديو يعمل، وأن الكوكيز صحيحة (YT_COOKIES)، ثم حاول مرة أخرى."
-        )
-    except Exception as e:
-        print("Error in start_cutting:", e)
-        bot.send_message(chat_id, "❌ حدث خطأ أثناء القص أو التحميل.")
-    finally:
-        # تنظيف الملفات المؤقتة
-        try:
-            if input_file and os.path.exists(input_file):
-                os.remove(input_file)
-            if os.path.exists(cut_file):
-                os.remove(cut_file)
-            for p in part_files:
-                if os.path.exists(p):
-                    os.remove(p)
-        except Exception:
-            pass
-
-
-# ========= تشغيل البوت مع إعادة المحاولة عند أخطاء الاتصال =========
+# ========= تشغيل البوت مع إعادة المحاولة =========
 if __name__ == "__main__":
     print("🔥 Bot is running…")
     while True:
         try:
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            bot.infinity_polling(skip_pending=True)
+        except ApiTelegramException as e:
+            logging.error(f"Polling error from Telegram: {e}")
+            # غالباً يعني أن نفس التوكن يعمل في مكان آخر أيضاً
+            if getattr(e, "error_code", None) == 409:
+                print("⚠️ يوجد تعارض 409: تأكد أن البوت لا يعمل على سيرفر آخر بنفس التوكن.")
+            time.sleep(5)
         except Exception as e:
-            print(f"⚠️ Polling error, will retry in 5s: {e}")
+            logging.exception("Unknown polling error, retry after 5s")
             time.sleep(5)
