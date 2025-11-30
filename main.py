@@ -1,135 +1,167 @@
 import telebot
-import subprocess
 import yt_dlp
 import os
+import subprocess
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# -------------------------------------------
-# تحويل الوقت تلقائياً (يدخل 10 ، 1:20 ، 01:02:33)
-# -------------------------------------------
-def parse_time(t):
-    parts = t.split(":")
-    parts = list(map(int, parts))
-    if len(parts) == 1:
-        return int(parts[0])
-    elif len(parts) == 2:
-        return parts[0] * 60 + parts[1]
-    elif len(parts) == 3:
-        return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    return 0
+users = {}  # لتخزين خطوات المحادثة لكل مستخدم
 
-# -------------------------------------------
-# استخراج رابط البث أو الفيديو الحقيقي
-# -------------------------------------------
-def get_stream_url(video_url, quality_code):
-    ydl_opts = {
-        "quiet": True,
-        "format": f"bestvideo[height={quality_code}]+bestaudio/best",
-        "noplaylist": True,
-    }
+# ------------------------ استخراج قائمة الجودة ------------------------
+def get_formats(url):
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "extractor_args": {
+                "youtube": {"player_client": ["default"]}
+            }
+        }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        return info["url"]
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats", [])
+            qualities = []
 
-# -------------------------------------------
-# قص مباشر بدون تحميل
-# -------------------------------------------
-def cut_video(stream_url, start, end):
-    output_file = "result.mp4"
-    duration = end - start
+            for f in formats:
+                if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    if f.get("format_id") and f.get("resolution"):
+                        qualities.append((f["format_id"], f["resolution"]))
 
-    command = [
-        "ffmpeg",
-        "-ss", str(start),
-        "-i", stream_url,
-        "-t", str(duration),
-        "-c", "copy",
-        output_file,
-        "-y"
-    ]
+            return qualities
 
-    subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return output_file
+    except Exception as e:
+        return None
 
-# -------------------------------------------
-# بدء البوت
-# -------------------------------------------
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "🎬 أرسل رابط الفيديو أو البث الآن:")
-    bot.register_next_step_handler(message, ask_start_time)
-
-# حفظ الرابط
-user_links = {}
-user_times = {}
-user_quality = {}
-
-# الخطوة 2 — بداية القص
-def ask_start_time(message):
-    chat_id = message.chat.id
-    user_links[chat_id] = message.text
-
-    bot.send_message(chat_id, "⏱️ أرسل وقت البداية (مثال: 10 أو 1:20)")
-    bot.register_next_step_handler(message, ask_end_time)
-
-# الخطوة 3 — نهاية القص
-def ask_end_time(message):
-    chat_id = message.chat.id
-    start_t = parse_time(message.text)
-    user_times[chat_id] = {"start": start_t}
-
-    bot.send_message(chat_id, "⏱️ أرسل وقت النهاية (مثال: 5:00 أو 1:10:00)")
-    bot.register_next_step_handler(message, ask_quality)
-
-# الخطوة 4 — اختيار الجودة
-def ask_quality(message):
-    chat_id = message.chat.id
-    end_t = parse_time(message.text)
-    user_times[chat_id]["end"] = end_t
-
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    qs = ["144", "240", "360", "480", "720", "1080"]
-    for q in qs:
-        markup.add(f"{q}p")
-
-    bot.send_message(chat_id, "🎚️ اختر الجودة:", reply_markup=markup)
-    bot.register_next_step_handler(message, start_cutting)
-
-# الخطوة 5 — تنفيذ القص
-def start_cutting(message):
-    chat_id = message.chat.id
-    quality = message.text.replace("p", "")
-    user_quality[chat_id] = int(quality)
-
-    bot.send_message(chat_id, "🔄 جاري تجهيز الرابط…")
-
-    url = user_links[chat_id]
-    start = user_times[chat_id]["start"]
-    end = user_times[chat_id]["end"]
-    q = user_quality[chat_id]
+# ------------------------ قص الفيديو ------------------------
+def cut_video(url, start_time, end_time, format_id):
+    output = "cut.mp4"
 
     try:
-        stream = get_stream_url(url, q)
+        ydl_opts = {
+            "format": format_id,
+            "outtmpl": "source.%(ext)s",
+            "extractor_args": {
+                "youtube": {"player_client": ["default"]}
+            }
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
+
+        # قص مقطع
+        cmd = [
+            "ffmpeg",
+            "-ss", start_time,
+            "-to", end_time,
+            "-i", file_path,
+            "-c", "copy",
+            output,
+            "-y"
+        ]
+
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        os.remove(file_path)
+        return output
+
     except Exception as e:
-        bot.send_message(chat_id, f"❌ خطأ في استخراج الفيديو:\n{e}")
+        return None
+
+
+# ------------------------ الأوامر ------------------------
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "أرسل رابط الفيديو من فضلك 🎬")
+    users[message.chat.id] = {"step": "url"}
+
+
+@bot.message_handler(func=lambda m: True)
+def handler(message):
+    chat_id = message.chat.id
+    text = message.text
+
+    if chat_id not in users:
+        users[chat_id] = {"step": "url"}
+
+    step = users[chat_id]["step"]
+
+    # -------- الخطوة 1: وضع الرابط --------
+    if step == "url":
+        users[chat_id]["url"] = text
+        bot.send_message(chat_id, "⏳ يتم فحص الجودة…")
+
+        formats = get_formats(text)
+
+        if not formats:
+            bot.send_message(chat_id, "❌ فشل استخراج الجودة، أرسل رابطاً صالحاً.")
+            return
+
+        msg = "🎚 اختر الجودة:\n"
+        for f in formats:
+            msg += f"• {f[0]} — {f[1]}\n"
+
+        bot.send_message(chat_id, msg)
+        bot.send_message(chat_id, "✏ اكتب كود الجودة (format_id) مثل: 18 أو 22…")
+
+        users[chat_id]["formats"] = formats
+        users[chat_id]["step"] = "quality"
         return
 
-    bot.send_message(chat_id, "✂️ جاري قص الفيديو… قد يستغرق بعض الوقت")
+    # -------- الخطوة 2: اختيار الجودة --------
+    if step == "quality":
+        format_id = text.strip()
 
-    output = cut_video(stream, start, end)
+        valid_formats = [f[0] for f in users[chat_id]["formats"]]
+        if format_id not in valid_formats:
+            bot.send_message(chat_id, "❌ جودة غير موجودة. أعد المحاولة.")
+            return
 
-    bot.send_message(chat_id, "📤 جاري إرسال الملف…")
+        users[chat_id]["format_id"] = format_id
+        bot.send_message(chat_id, "⏱ الآن أرسل وقت البداية (مثال: 00:01:20)")
+        users[chat_id]["step"] = "start"
+        return
 
-    # إرسال كـ Document ليقبل الحجم الكبير
-    with open(output, "rb") as f:
-        bot.send_document(chat_id, f)
+    # -------- الخطوة 3: وقت البداية --------
+    if step == "start":
+        users[chat_id]["start"] = text.strip()
+        bot.send_message(chat_id, "⏱ الآن أرسل وقت النهاية (مثال: 00:05:00)")
+        users[chat_id]["step"] = "end"
+        return
 
-    os.remove(output)
-    bot.send_message(chat_id, "✅ تم الإرسال بنجاح!", reply_markup=telebot.types.ReplyKeyboardRemove())
+    # -------- الخطوة 4: وقت النهاية + التنفيذ --------
+    if step == "end":
+        url = users[chat_id]["url"]
+        start_t = users[chat_id]["start"]
+        end_t = text.strip()
+        format_id = users[chat_id]["format_id"]
 
-# تشغيل البوت
+        bot.send_message(chat_id, "🔧 جاري القص… الرجاء الانتظار")
+
+        result = cut_video(url, start_t, end_t, format_id)
+
+        if result is None or not os.path.exists(result):
+            bot.send_message(chat_id, "❌ فشل القص. حاول بجودة مختلفة.")
+            return
+
+        size = os.path.getsize(result)
+
+        # إذا الملف كبير جداً → ارسال document
+        if size > 45 * 1024 * 1024:
+            with open(result, "rb") as f:
+                bot.send_document(chat_id, f, caption="🎬 المقطع جاهز!")
+        else:
+            with open(result, "rb") as f:
+                bot.send_video(chat_id, f, caption="🎬 المقطع جاهز!")
+
+        os.remove(result)
+        users.pop(chat_id, None)
+
+        bot.send_message(chat_id, "✔ انتهى! أرسل رابط فيديو جديد.")
+
+# ------------------------ تشغيل البوت ------------------------
 print("🔥 Bot is running…")
 bot.infinity_polling(skip_pending=True)
