@@ -3,75 +3,112 @@ import subprocess
 import yt_dlp
 import os
 
-BOT_TOKEN = "ضع_توكن_البوت_هنا"
+# ===========================
+# قراءة التوكن من متغير البيئة
+# ===========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN غير موجود داخل Koyeb Environment Variables")
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# ===========================
+# استخراج رابط الستريم مباشرة (بدون تحميل)
+# ===========================
 def get_stream_url(video_url):
     ydl_opts = {
-        "format": "best",
         "quiet": True,
+        "format": "best",
         "noplaylist": True,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
-        return info["url"]  # رابط الستريم الحقيقي
+        return info["url"]
 
 
+# ===========================
+# قص الفيديو مباشرة من الستريم
+# ===========================
 def cut_video_stream(stream_url, start_time, duration):
     output_file = "cut.mp4"
-
-    # قص مباشر دون تحميل كامل
     command = [
         "ffmpeg",
         "-ss", start_time,
         "-i", stream_url,
         "-t", duration,
         "-c", "copy",
+        output_file,
         "-y",
-        output_file
     ]
 
-    subprocess.run(command)
-    return output_file
+    process = subprocess.run(command, capture_output=True, text=True)
+
+    if process.returncode != 0:
+        return None, process.stderr
+
+    return output_file, None
+
+
+# ===========================
+#  استقبال أمر /cut
+# ===========================
+user_sessions = {}
 
 
 @bot.message_handler(commands=['cut'])
-def start_cut(message):
-    bot.reply_to(message, "📹 أرسل رابط الفيديو الآن:")
-    bot.register_next_step_handler(message, get_url)
+def ask_video(message):
+    bot.reply_to(message, "📹 أرسل رابط الفيديو الذي تريد قصه:")
+    user_sessions[message.chat.id] = {"step": 1}
 
 
-def get_url(message):
-    url = message.text.strip()
-    bot.reply_to(message, "⏳ أرسل وقت البداية بصيغة:\n00:01:30")
-    bot.register_next_step_handler(message, get_start, url)
+@bot.message_handler(func=lambda m: m.chat.id in user_sessions)
+def process_steps(message):
+    chat_id = message.chat.id
+    step = user_sessions[chat_id]["step"]
 
+    # الخطوة 1 – استقبال الرابط
+    if step == 1:
+        user_sessions[chat_id]["url"] = message.text
+        bot.send_message(chat_id, "⏱️ أرسل وقت البداية (مثال: 00:01:30):")
+        user_sessions[chat_id]["step"] = 2
 
-def get_start(message, url):
-    start = message.text.strip()
-    bot.reply_to(message, "⏳ أرسل المدة المطلوبة بصيغة:\n00:05:00")
-    bot.register_next_step_handler(message, process_cut, url, start)
+    # الخطوة 2 – استقبال البداية
+    elif step == 2:
+        user_sessions[chat_id]["start"] = message.text
+        bot.send_message(chat_id, "⏱️ أرسل وقت النهاية (مثال: 00:05:00):")
+        user_sessions[chat_id]["step"] = 3
 
+    # الخطوة 3 – استقبال النهاية والقص
+    elif step == 3:
+        start = user_sessions[chat_id]["start"]
+        end = message.text
 
-def process_cut(message, url, start):
-    duration = message.text.strip()
+        bot.send_message(chat_id, "🔍 جاري تجهيز الستريم...")
 
-    try:
-        bot.reply_to(message, "🎬 جاري تجهيز رابط البث…")
-        stream = get_stream_url(url)
+        try:
+            stream_url = get_stream_url(user_sessions[chat_id]["url"])
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ فشل استخراج الستريم:\n{e}")
+            user_sessions.pop(chat_id, None)
+            return
 
-        bot.reply_to(message, "✂️ جاري القص… انتظر قليلاً")
+        bot.send_message(chat_id, "✂️ جاري القص بدون تحميل كامل، انتظر...")
 
-        output = cut_video_stream(stream, start, duration)
+        # حساب المدة = النهاية - البداية
+        duration = end
 
-        with open(output, "rb") as video:
-            bot.send_video(message.chat.id, video)
+        output, error = cut_video_stream(stream_url, start, duration)
 
-        os.remove(output)
+        if error:
+            bot.send_message(chat_id, f"❌ حدث خطأ أثناء القص:\n{error}")
+        else:
+            with open(output, "rb") as vid:
+                bot.send_video(chat_id, vid)
 
-    except Exception as e:
-        bot.reply_to(message, f"❌ خطأ: {e}")
+            os.remove(output)
+
+        user_sessions.pop(chat_id, None)
 
 
 print("🔥 Bot is running…")
