@@ -1,4 +1,5 @@
-pyTelegramBotAPI
-yt_dlp
-ffmpeg-python
-python-dotenv
+pytelegrambotapi
+yt-dlp
+pydub
+google-cloud-speech
+requests
