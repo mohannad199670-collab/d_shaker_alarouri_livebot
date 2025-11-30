@@ -1,116 +1,83 @@
+import telebot
+import yt_dlp
 import os
-import requests
-from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
+from telebot.types import ReplyKeyboardRemove
 
-# ------------------------------
-#  قراءة المتغيّرات من Koyeb
-# ------------------------------
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ASSEMBLY_API = os.getenv("ASSEMBLYAI_API_KEY")
+BOT_TOKEN = "8487554427:AAG6Mt-IaWy0JN2mCE-Fmh1SCrloL2WxSeQ"
+bot = telebot.TeleBot(BOT_TOKEN)
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ يجب وضع TELEGRAM_TOKEN في متغيرات البيئة")
+# تخزين حالة كل مستخدم
+user_states = {}
 
-if not ASSEMBLY_API:
-    raise RuntimeError("❌ يجب وضع ASSEMBLYAI_API_KEY في متغيرات البيئة")
+def download_video(url):
+    ydl_opts = {
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": "source.%(ext)s"
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+        info = ydl.extract_info(url, download=False)
+        return ydl.prepare_filename(info)
 
-# ------------------------------
-#  دالة الترحيب
-# ------------------------------
-def start(update, context):
-    update.message.reply_text(
-        "🎙️ أهلاً بك!\n"
-        "أرسل لي أي *رسالة صوتية* أو *مقطع صوت* أو *فيديو* وسأقوم بتحويله إلى نص مكتوب 📄🔥"
-    )
+def cut_video(source, start, end, output="cut.mp4"):
+    cmd = f"ffmpeg -i '{source}' -ss {start} -to {end} -c copy {output} -y"
+    os.system(cmd)
+    return output
 
-# ------------------------------
-#  تحميل الملف من تليجرام
-# ------------------------------
-def download_file(file_id, bot):
-    file = bot.get_file(file_id)
-    file_path = "audio_input.ogg"
-    file.download(file_path)
-    return file_path
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "🎬 أهلاً بك! أرسل رابط الفيديو من يوتيوب أو تيك توك.")
+    user_states[message.chat.id] = {"step": "awaiting_url"}
 
-# ------------------------------
-#  رفع الملف إلى AssemblyAI
-# ------------------------------
-def upload_to_assemblyai(file_path):
-    headers = {"authorization": ASSEMBLY_API}
-    with open(file_path, "rb") as f:
-        response = requests.post(
-            "https://api.assemblyai.com/v2/upload",
-            headers=headers,
-            data=f
-        )
-    return response.json()["upload_url"]
+@bot.message_handler(func=lambda m: True)
+def handle_message(message):
+    chat_id = message.chat.id
+    text = message.text.strip()
 
-# ------------------------------
-#  طلب التفريغ من AssemblyAI
-# ------------------------------
-def transcribe_audio(url):
-    endpoint = "https://api.assemblyai.com/v2/transcript"
-    json_data = {"audio_url": url, "language_code": "ar"}
-    headers = {"authorization": ASSEMBLY_API}
+    if chat_id not in user_states:
+        user_states[chat_id] = {"step": "awaiting_url"}
 
-    response = requests.post(endpoint, json=json_data, headers=headers)
-    transcript_id = response.json()["id"]
+    step = user_states[chat_id]["step"]
 
-    # الانتظار حتى يجهز التفريغ
-    while True:
-        status = requests.get(
-            endpoint + "/" + transcript_id,
-            headers=headers
-        ).json()
+    # 1 - استلام الرابط
+    if step == "awaiting_url":
+        if text.startswith("http"):
+            user_states[chat_id]["url"] = text
+            user_states[chat_id]["step"] = "await_start"
 
-        if status["status"] == "completed":
-            return status["text"]
-
-        if status["status"] == "error":
-            return "❌ حدث خطأ أثناء التفريغ."
-
-# ------------------------------
-#  استقبال الملفات الصوتية
-# ------------------------------
-def handle_audio(update, context):
-    bot = context.bot
-
-    update.message.reply_text("⏳ جاري التفريغ... انتظر قليلاً 🔥")
-
-    # اختيار نوع الملف
-    file = None
-    if update.message.voice:
-        file = update.message.voice.file_id
-    elif update.message.audio:
-        file = update.message.audio.file_id
-    elif update.message.video_note:
-        file = update.message.video_note.file_id
-    elif update.message.video:
-        file = update.message.video.file_id
-    else:
-        update.message.reply_text("❌ الرجاء إرسال مقطع صوتي أو فيديو.")
+            bot.reply_to(chat_id, "⏱️ ممتاز! أرسل **وقت البداية**\nمثال: 00:10")
+        else:
+            bot.reply_to(chat_id, "❌ أرسل رابط صحيح.")
         return
 
-    file_path = download_file(file, bot)
-    audio_url = upload_to_assemblyai(file_path)
-    text = transcribe_audio(audio_url)
+    # 2 - استلام وقت البداية
+    if step == "await_start":
+        user_states[chat_id]["start"] = text
+        user_states[chat_id]["step"] = "await_end"
+        bot.reply_to(chat_id, "⏳ الآن أرسل **وقت النهاية**\nمثال: 05:00")
+        return
 
-    update.message.reply_text("📄 *النص المستخرج:*\n\n" + text)
+    # 3 - استلام وقت النهاية
+    if step == "await_end":
+        user_states[chat_id]["end"] = text
 
+        url = user_states[chat_id]["url"]
+        start = user_states[chat_id]["start"]
+        end = user_states[chat_id]["end"]
 
-# ------------------------------
-#  تشغيل البوت
-# ------------------------------
-def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+        bot.reply_to(chat_id, "🔧 جاري القص… انتظر قليلاً")
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.all, handle_audio))
+        try:
+            src = download_video(url)
+            output = cut_video(src, start, end)
 
-    updater.start_polling()
-    updater.idle()
+            with open(output, "rb") as v:
+                bot.send_video(chat_id, v)
 
+            os.remove(src)
+            os.remove(output)
 
-if __name__ == "__main__":
-    main()
+        except Exception as e:
+            bot.reply_to(chat_id, f"❌ حدث خطأ أثناء القص:\n{e}")
+
+        user_states[chat_id]["step"] = "awaiting_url"
