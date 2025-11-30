@@ -1,126 +1,135 @@
-import os
 import telebot
-import yt_dlp
 import subprocess
+import yt_dlp
+import os
 
-# قراءة التوكن من Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# -------------------------------------------
+# تحويل الوقت تلقائياً (يدخل 10 ، 1:20 ، 01:02:33)
+# -------------------------------------------
+def parse_time(t):
+    parts = t.split(":")
+    parts = list(map(int, parts))
+    if len(parts) == 1:
+        return int(parts[0])
+    elif len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    elif len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return 0
 
-# تحويل صيغة الوقت تلقائياً من 10 أو 1:20 أو 01:02:33
-def normalize_time(t):
-    try:
-        parts = t.split(":")
-        parts = [int(p) for p in parts]
-
-        if len(parts) == 1:
-            # ثواني فقط
-            return f"00:00:{parts[0]:02d}"
-        elif len(parts) == 2:
-            # دقائق + ثواني
-            return f"00:{parts[0]:02d}:{parts[1]:02d}"
-        elif len(parts) == 3:
-            # ساعات + دقائق + ثواني
-            return f"{parts[0]:02d}:{parts[1]:02d}:{parts[2]:02d}"
-        else:
-            return t
-    except:
-        return t
-
-
-# 📌 الحصول على رابط البث أو الفيديو الحقيقي بدون تحميل
-def get_stream_url(video_url):
+# -------------------------------------------
+# استخراج رابط البث أو الفيديو الحقيقي
+# -------------------------------------------
+def get_stream_url(video_url, quality_code):
     ydl_opts = {
-        "format": "best",
         "quiet": True,
-        "noplaylist": True
+        "format": f"bestvideo[height={quality_code}]+bestaudio/best",
+        "noplaylist": True,
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         return info["url"]
 
-
-# 📌 قص الفيديو بدون تحميله (مباشر من الرابط)
-def cut_video_stream(stream_url, start_time, duration):
-    output_file = "cut.mp4"
+# -------------------------------------------
+# قص مباشر بدون تحميل
+# -------------------------------------------
+def cut_video(stream_url, start, end):
+    output_file = "result.mp4"
+    duration = end - start
 
     command = [
         "ffmpeg",
-        "-ss", start_time,
+        "-ss", str(start),
         "-i", stream_url,
-        "-t", duration,
+        "-t", str(duration),
         "-c", "copy",
-        output_file
+        output_file,
+        "-y"
     ]
 
-    try:
-        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        return output_file
-    except Exception as e:
-        return None
+    subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return output_file
 
-
-# 🚀 الرد على /start
+# -------------------------------------------
+# بدء البوت
+# -------------------------------------------
 @bot.message_handler(commands=['start'])
-def start_message(message):
-    bot.reply_to(message, "أرسل رابط فيديو أو بث مباشر من اليوتيوب.")
+def start(message):
+    bot.reply_to(message, "🎬 أرسل رابط الفيديو أو البث الآن:")
+    bot.register_next_step_handler(message, ask_start_time)
 
+# حفظ الرابط
+user_links = {}
+user_times = {}
+user_quality = {}
 
-# 🚀 استقبال الرابط
-@bot.message_handler(func=lambda m: "youtube.com" in m.text or "youtu.be" in m.text)
-def process_link(message):
+# الخطوة 2 — بداية القص
+def ask_start_time(message):
     chat_id = message.chat.id
-    url = message.text.strip()
+    user_links[chat_id] = message.text
 
-    bot.send_message(chat_id, "📌 أرسل وقت البداية (ثواني فقط أو نص مثل 1:20 أو 01:05:22):")
-    bot.register_next_step_handler(message, lambda m: ask_end_time(m, url))
+    bot.send_message(chat_id, "⏱️ أرسل وقت البداية (مثال: 10 أو 1:20)")
+    bot.register_next_step_handler(message, ask_end_time)
 
-
-def ask_end_time(message, url):
+# الخطوة 3 — نهاية القص
+def ask_end_time(message):
     chat_id = message.chat.id
-    start_time_raw = message.text.strip()
-    start_time = normalize_time(start_time_raw)
+    start_t = parse_time(message.text)
+    user_times[chat_id] = {"start": start_t}
 
-    bot.send_message(chat_id, "⏳ أرسل وقت النهاية:")
-    bot.register_next_step_handler(message, lambda m: start_cutting(m, url, start_time))
+    bot.send_message(chat_id, "⏱️ أرسل وقت النهاية (مثال: 5:00 أو 1:10:00)")
+    bot.register_next_step_handler(message, ask_quality)
 
-
-def start_cutting(message, url, start_time):
+# الخطوة 4 — اختيار الجودة
+def ask_quality(message):
     chat_id = message.chat.id
-    end_time_raw = message.text.strip()
-    end_time = normalize_time(end_time_raw)
+    end_t = parse_time(message.text)
+    user_times[chat_id]["end"] = end_t
 
-    bot.send_message(chat_id, "🔍 جاري تجهيز الرابط…")
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    qs = ["144", "240", "360", "480", "720", "1080"]
+    for q in qs:
+        markup.add(f"{q}p")
+
+    bot.send_message(chat_id, "🎚️ اختر الجودة:", reply_markup=markup)
+    bot.register_next_step_handler(message, start_cutting)
+
+# الخطوة 5 — تنفيذ القص
+def start_cutting(message):
+    chat_id = message.chat.id
+    quality = message.text.replace("p", "")
+    user_quality[chat_id] = int(quality)
+
+    bot.send_message(chat_id, "🔄 جاري تجهيز الرابط…")
+
+    url = user_links[chat_id]
+    start = user_times[chat_id]["start"]
+    end = user_times[chat_id]["end"]
+    q = user_quality[chat_id]
 
     try:
-        stream_url = get_stream_url(url)
-    except:
-        bot.send_message(chat_id, "❌ حدث خطأ أثناء الحصول على رابط الفيديو.")
+        stream = get_stream_url(url, q)
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ خطأ في استخراج الفيديو:\n{e}")
         return
 
-    # حساب مدة القص
-    def to_seconds(t):
-        h, m, s = t.split(":")
-        return int(h)*3600 + int(m)*60 + int(s)
+    bot.send_message(chat_id, "✂️ جاري قص الفيديو… قد يستغرق بعض الوقت")
 
-    duration_seconds = to_seconds(end_time) - to_seconds(start_time)
-    duration = str(duration_seconds)
+    output = cut_video(stream, start, end)
 
-    bot.send_message(chat_id, "✂️ جاري قص المقطع… يرجى الانتظار")
+    bot.send_message(chat_id, "📤 جاري إرسال الملف…")
 
-    cut_file = cut_video_stream(stream_url, start_time, duration)
+    # إرسال كـ Document ليقبل الحجم الكبير
+    with open(output, "rb") as f:
+        bot.send_document(chat_id, f)
 
-    if cut_file and os.path.exists(cut_file):
-        bot.send_message(chat_id, "📤 جاري إرسال المقطع…")
-        with open(cut_file, "rb") as video:
-            bot.send_video(chat_id, video)
-        os.remove(cut_file)
-    else:
-        bot.send_message(chat_id, "❌ حدث خطأ أثناء القص.")
-
+    os.remove(output)
+    bot.send_message(chat_id, "✅ تم الإرسال بنجاح!", reply_markup=telebot.types.ReplyKeyboardRemove())
 
 # تشغيل البوت
-if __name__ == "__main__":
-    print("🔥 Bot is running…")
-    bot.infinity_polling(skip_pending=True)
+print("🔥 Bot is running…")
+bot.infinity_polling(skip_pending=True)
