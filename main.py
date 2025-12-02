@@ -990,7 +990,7 @@ def ask_video_or_audio(chat_id: int):
     )
     bot.send_message(
         chat_id,
-        "🎚️ <b>اختر نوع الملف الذي تريده:</b>",
+        "🎛️ <b>اختر نوع الملف الذي تريده:</b>",
         reply_markup=markup
     )
 
