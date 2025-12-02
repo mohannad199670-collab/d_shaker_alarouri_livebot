@@ -1122,16 +1122,40 @@ def show_admin_panel(chat_id: int):
         reply_markup=markup
     )
 
-    # لوحة داخلية بأزرار إنلاين
+    def show_admin_panel(chat_id: int):
+    """عرض لوحة التحكم للأدمن"""
+
+    # لوحة التحكم الأساسية (Reply Keyboard)
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("✂️ قص مقطع يوتيوب"),
+        KeyboardButton("📦 الاشتراكات"),
+    )
+    markup.add(KeyboardButton("⚙️ الإعدادات"))
+    markup.add(KeyboardButton("🛠 لوحة التحكم"))
+
+    bot.send_message(
+        chat_id,
+        "🛠 <b>لوحة التحكم الإدارية</b>\n"
+        "اختر الإجراء المطلوب:",
+        reply_markup=markup
+    )
+
+    # لوحة التحكم الداخلية (Inline)
     inline = InlineKeyboardMarkup()
     inline.row(
         InlineKeyboardButton("✅ تفعيل اشتراك", callback_data="admin_activate"),
         InlineKeyboardButton("⛔ إلغاء اشتراك", callback_data="admin_cancel"),
     )
     inline.row(
-        InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
+        InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats")
     )
-    bot.send_message(chat_id, "اختر من لوحة التحكم:", reply_markup=inline)
+
+    bot.send_message(
+        chat_id,
+        "🔽 اختر أحد الإجراءات التالية:",
+        reply_markup=inline
+)
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ["admin_activate", "admin_cancel", "admin_stats"])
