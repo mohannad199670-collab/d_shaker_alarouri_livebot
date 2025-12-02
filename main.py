@@ -1316,14 +1316,15 @@ def start_cutting(chat_id: int):
 # ================ معالجة إدخال ID في لوحة التحكم ================
 
 @bot.message_handler(func=lambda m: m.text is not None and m.chat.id == ADMIN_ID)
+@bot.message_handler(func=lambda m: m.text and m.from_user.id == ADMIN_ID)
 def handle_admin_text_extra(message):
     """معالجة نصوص إضافية للأدمن (ID للتفعيل/الإلغاء)"""
     chat_id = message.chat.id
     session = user_sessions.get(chat_id) or {}
     step = session.get("step")
 
+    # ====== تفعيل اشتراك عبر ID ======
     if step == "admin_wait_user_id":
-        # تفعيل اشتراك لباقته المختارة
         plan_key = session.get("admin_chosen_plan")
         plan = PLANS.get(plan_key) if plan_key else None
         if not plan:
@@ -1356,6 +1357,7 @@ def handle_admin_text_extra(message):
         user_sessions[chat_id] = session
         return
 
+    # ====== إلغاء اشتراك عبر ID ======
     if step == "admin_cancel_wait_id":
         try:
             target_id = int(message.text.strip())
@@ -1380,19 +1382,5 @@ def handle_admin_text_extra(message):
         user_sessions[chat_id] = session
         return
 
-    # إن لم يكن في خطوة إدارية خاصة، نترك المعالجة للهاندلر الأساسي
+    # إن لم يكن في خطوة إدارية خاصة، نمرره للهاندلر الأساسي
     handle_text(message)
-
-
-# ================ تشغيل البوت مع معالجة أخطاء polling =================
-if __name__ == "__main__":
-    logger.info("🔥 Bot is running…")
-
-    while True:
-        try:
-            # skip_pending=True حتى لا يأخذ رسائل قديمة عند كل إعادة تشغيل
-            bot.infinity_polling(skip_pending=True, timeout=60)
-        except Exception as e:
-            logger.error("Polling error from Telegram: %s", e)
-            # لو ظهر خطأ 409 فهذا يعني أن هناك نسخة أخرى من البوت تعمل بنفس التوكن
-            time.sleep(5)
