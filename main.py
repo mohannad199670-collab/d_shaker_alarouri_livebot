@@ -325,24 +325,13 @@ def reset_session(chat_id: int):
 
 def build_main_keyboard(chat_id: int):
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-
-    # الصف الأول: قص + الاشتراكات للجميع
-    kb.row(
+    kb.add(
         KeyboardButton("✂️ قص مقطع يوتيوب"),
         KeyboardButton("📦 الاشتراكات"),
     )
-
-    # الصف الثاني:
+    kb.add(KeyboardButton("⚙️ الإعدادات"))
     if is_admin(chat_id):
-        # للأدمن: الإعدادات + لوحة التحكم معاً
-        kb.row(
-            KeyboardButton("⚙️ الإعدادات"),
-            KeyboardButton("🛠 لوحة التحكم"),
-        )
-    else:
-        # للمستخدم العادي: الإعدادات فقط
-        kb.row(KeyboardButton("⚙️ الإعدادات"))
-
+        kb.add(KeyboardButton("🛠 لوحة التحكم"))
     return kb
 
 
@@ -717,6 +706,72 @@ def handle_text(message):
     if text.startswith("/"):
         return
 
+    # نحصل على جلسة المستخدم مبكراً
+    session = user_sessions.get(chat_id) or {}
+    step = session.get("step")
+
+    # ================== منطق إدخال ID للأدمن ==================
+    if is_admin(chat_id):
+        # تفعيل اشتراك يدوي
+        if step == "admin_wait_user_id":
+            plan_key = session.get("admin_chosen_plan")
+            plan = PLANS.get(plan_key) if plan_key else None
+            if not plan:
+                bot.reply_to(message, "⚠️ اختر الباقة أولاً من لوحة التحكم.")
+                return
+
+            try:
+                target_id = int(text)
+            except ValueError:
+                bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
+                return
+
+            set_subscription(target_id, plan_key)
+            status = subscription_status_text(target_id)
+
+            bot.send_message(
+                chat_id,
+                f"✅ تم تفعيل باقة <b>{plan['name']}</b> للمستخدم ID: <code>{target_id}</code>."
+            )
+            try:
+                bot.send_message(
+                    target_id,
+                    "✅ تم تفعيل اشتراكك من قبل الإدارة.\n\n" + status
+                )
+            except Exception:
+                pass
+
+            session["step"] = None
+            session["admin_chosen_plan"] = None
+            user_sessions[chat_id] = session
+            return
+
+        # إلغاء اشتراك يدوي
+        if step == "admin_cancel_wait_id":
+            try:
+                target_id = int(text)
+            except ValueError:
+                bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
+                return
+
+            clear_subscription(target_id)
+            bot.send_message(
+                chat_id,
+                f"⛔ تم إلغاء اشتراك المستخدم ID: <code>{target_id}</code>."
+            )
+            try:
+                bot.send_message(
+                    target_id,
+                    "⛔ تم إلغاء اشتراكك من قبل الإدارة."
+                )
+            except Exception:
+                pass
+
+            session["step"] = None
+            user_sessions[chat_id] = session
+            return
+    # ========================================================
+
     # لوحة المفاتيح الرئيسية
     if text == "✂️ قص مقطع يوتيوب":
         if not has_active_subscription(chat_id):
@@ -930,7 +985,7 @@ def ask_video_or_audio(chat_id: int):
     )
 
 
-# ========== كولباكات الاشتراكات والجودات وأنواع الملفات وطلبات الدفع ولوحة التحكم ==========
+# ========== كولباكات الاشتراكات والجودات وأنواع الملفات وطلبات الدفع ==========
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
@@ -1012,14 +1067,14 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "الباقة غير معروفة.", show_alert=True)
             return
 
-        chat_id_user = call.from_user.id
-        session = user_sessions.setdefault(chat_id_user, {})
+        chat_id = call.from_user.id
+        session = user_sessions.setdefault(chat_id, {})
         session["pending_plan"] = plan_key
         session["step"] = "await_payment_proof"
 
         bot.answer_callback_query(call.id, f"تم اختيار الباقة: {plan['name']}")
         bot.send_message(
-            chat_id_user,
+            chat_id,
             "📸 الآن أرسل لقطة شاشة لإشعار الدفع ليتم مراجعة طلبك وتفعيل الاشتراك."
         )
         return
@@ -1113,52 +1168,18 @@ def handle_callbacks(call):
         start_cutting(chat_id)
         return
 
-    # سادساً: كولباكات لوحة التحكم الإدارية (تفعيل، إلغاء، إحصائيات)
-    if data in ["admin_activate", "admin_cancel", "admin_stats"]:
-        if not is_admin(chat_id):
-            bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
-            return
-
-        admin_session = user_sessions.setdefault(chat_id, {})
-
-        if data == "admin_activate":
-            bot.answer_callback_query(call.id)
-            bot.send_message(
-                chat_id,
-                "✅ اختر أولاً الباقة التي تريد تفعيلها للمستخدم:",
-                reply_markup=build_plans_keyboard(for_admin_manual=True),
-            )
-            return
-
-        if data == "admin_cancel":
-            bot.answer_callback_query(call.id)
-            admin_session["step"] = "admin_cancel_wait_id"
-            bot.send_message(
-                chat_id,
-                "⛔ أرسل الآن <b>ID</b> المستخدم الذي تريد إلغاء اشتراكه."
-            )
-            return
-
-        if data == "admin_stats":
-            bot.answer_callback_query(call.id)
-            bot.send_message(chat_id, get_stats_text())
-            return
-
-    # افتراضي
-    bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id)  # افتراضي
 
 
 def show_admin_panel(chat_id: int):
     """عرض لوحة التحكم للأدمن"""
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    markup.row(
+    markup.add(
         KeyboardButton("✂️ قص مقطع يوتيوب"),
         KeyboardButton("📦 الاشتراكات"),
     )
-    markup.row(
-        KeyboardButton("⚙️ الإعدادات"),
-        KeyboardButton("🛠 لوحة التحكم"),
-    )
+    markup.add(KeyboardButton("⚙️ الإعدادات"))
+    markup.add(KeyboardButton("🛠 لوحة التحكم"))
 
     bot.send_message(
         chat_id,
@@ -1177,6 +1198,40 @@ def show_admin_panel(chat_id: int):
         InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
     )
     bot.send_message(chat_id, "اختر من لوحة التحكم:", reply_markup=inline)
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ["admin_activate", "admin_cancel", "admin_stats"])
+def handle_admin_panel_callbacks(call):
+    chat_id = call.message.chat.id
+    if not is_admin(chat_id):
+        bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
+        return
+
+    data = call.data
+    admin_session = user_sessions.setdefault(chat_id, {})
+
+    if data == "admin_activate":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "✅ اختر أولاً الباقة التي تريد تفعيلها للمستخدم:",
+            reply_markup=build_plans_keyboard(for_admin_manual=True),
+        )
+        return
+
+    if data == "admin_cancel":
+        bot.answer_callback_query(call.id)
+        admin_session["step"] = "admin_cancel_wait_id"
+        bot.send_message(
+            chat_id,
+            "⛔ أرسل الآن <b>ID</b> المستخدم الذي تريد إلغاء اشتراكه."
+        )
+        return
+
+    if data == "admin_stats":
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, get_stats_text())
+        return
 
 
 def start_cutting(chat_id: int):
@@ -1313,85 +1368,15 @@ def start_cutting(chat_id: int):
             pass
 
 
-# ================ معالجة إدخال ID في لوحة التحكم ================
+# ================ تشغيل البوت مع معالجة أخطاء polling =================
+if __name__ == "__main__":
+    logger.info("🔥 Bot is running…")
 
-@bot.message_handler(func=lambda m: m.text is not None)
-def handle_admin_text_extra(message):
-    chat_id = message.chat.id
-    text = message.text.strip()
-
-    # تحديد جلسة المستخدم
-    session = user_sessions.get(chat_id) or {}
-    step = session.get("step")
-
-    # لو المرسل ليس الأدمن → نعيده للهاندلر الأساسي
-    if not is_admin(chat_id):
-        return handle_text(message)
-
-    # ========== تفعيل الاشتراك (إدخال ID) ==========
-    if step == "admin_wait_user_id":
-        plan_key = session.get("admin_chosen_plan")
-        plan = PLANS.get(plan_key)
-
-        if not plan:
-            bot.reply_to(message, "⚠️ اختر الباقة أولاً من لوحة التحكم.")
-            return
-
+    while True:
         try:
-            target_id = int(text)
-        except ValueError:
-            bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
-            return
-
-        set_subscription(target_id, plan_key)
-        status = subscription_status_text(target_id)
-
-        bot.send_message(
-            chat_id,
-            f"✅ تم تفعيل باقة <b>{plan['name']}</b> للمستخدم ID: <code>{target_id}</code>."
-        )
-
-        # رسالة للمستخدم
-        try:
-            bot.send_message(
-                target_id,
-                "✅ تم تفعيل اشتراكك من قبل الإدارة.\n\n" + status
-            )
-        except Exception:
-            pass
-
-        session["step"] = None
-        session["admin_chosen_plan"] = None
-        user_sessions[chat_id] = session
-        return
-
-    # ========== إلغاء الاشتراك (إدخال ID) ==========
-    if step == "admin_cancel_wait_id":
-        try:
-            target_id = int(text)
-        except ValueError:
-            bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
-            return
-
-        clear_subscription(target_id)
-
-        bot.send_message(
-            chat_id,
-            f"⛔ تم إلغاء اشتراك المستخدم ID: <code>{target_id}</code>."
-        )
-
-        # رسالة للمستخدم
-        try:
-            bot.send_message(
-                target_id,
-                "⛔ تم إلغاء اشتراكك من قبل الإدارة."
-            )
-        except Exception:
-            pass
-
-        session["step"] = None
-        user_sessions[chat_id] = session
-        return
-
-    # لو لم يكن الأدمن في حالة إدخال ID → نعود للهاندلر الأساسي
-    return handle_text(message)
+            # skip_pending=True حتى لا يأخذ رسائل قديمة عند كل إعادة تشغيل
+            bot.infinity_polling(skip_pending=True, timeout=60)
+        except Exception as e:
+            logger.error("Polling error from Telegram: %s", e)
+            # لو ظهر خطأ 409 فهذا يعني أن هناك نسخة أخرى من البوت تعمل بنفس التوكن
+            time.sleep(5)
