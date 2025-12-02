@@ -4,7 +4,7 @@ import time
 import json
 import logging
 import subprocess
-from datetime import date, timedelta
+from datetime import datetime, date, timedelta
 
 import telebot
 from telebot.types import (
@@ -90,7 +90,6 @@ def today_str() -> str:
 
 
 def ensure_daily_reset(db):
-    """تصفير عداد زوار اليوم إذا تغير التاريخ."""
     t = today_str()
     if db.get("last_reset_date") != t:
         db["visitors_today"] = 0
@@ -183,7 +182,6 @@ def set_subscription(user_id: int, plan_key: str):
 
 
 def clear_subscription(user_id: int):
-    """إلغاء تفعيل اشتراك المستخدم (لا نحذف البيانات، فقط نوقفه)"""
     db = load_db()
     uid = str(user_id)
     users = db.setdefault("users", {})
@@ -232,7 +230,6 @@ def _normalize_subscription(user_id: int):
 
 
 def has_active_subscription(user_id: int) -> bool:
-    """الأدمن دائماً مسموح له، غيره حسب الاشتراك"""
     if is_admin(user_id):
         return True
     sub = _normalize_subscription(user_id)
@@ -240,13 +237,14 @@ def has_active_subscription(user_id: int) -> bool:
 
 
 def subscription_status_text(user_id: int) -> str:
-    """نص حالة الاشتراك للمستخدم"""
     sub = _normalize_subscription(user_id)
     if not sub or not sub.get("active"):
         return "غير مشترك حالياً."
 
     plan_name = sub.get("plan_name", "باقة غير معروفة")
     end_str = sub.get("end_date", "")
+    days_total = sub.get("days", 0)
+
     try:
         end_d = date.fromisoformat(end_str)
         remaining = (end_d - date.today()).days
@@ -263,7 +261,6 @@ def subscription_status_text(user_id: int) -> str:
 
 
 def get_stats_text() -> str:
-    """نص الإحصائيات (إجمالي الزوار + إجمالي المشتركين + زوار اليوم)"""
     db = load_db()
     users = db.get("users", {})
     total_visitors = len(users)
@@ -312,7 +309,6 @@ def get_stats_text() -> str:
 #       "quality_height": 360,
 #       "mode": "video" / "audio",
 #       "pending_plan": "p1" / "p3" / ...,
-#       "admin_chosen_plan": "p1" / ...
 #   }
 # }
 user_sessions = {}
@@ -328,7 +324,6 @@ def reset_session(chat_id: int):
 # ================ دوال مساعدة للواجهة ================
 
 def build_main_keyboard(chat_id: int):
-    """لوحة المفاتيح الرئيسية للمستخدم"""
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     kb.add(
         KeyboardButton("✂️ قص مقطع يوتيوب"),
@@ -591,8 +586,8 @@ def handle_start_cmd(message):
     # تسجيل الزيارة في قاعدة البيانات
     register_visit(user_id, first_name, username)
 
-    # إشعار للأدمن عند دخول مستخدم جديد /start (باستثناء دخول الأدمن نفسه)
-    if user_id != ADMIN_ID:
+    # إشعار للأدمن عند دخول مستخدم جديد /start
+    if is_admin(ADMIN_ID):
         try:
             username_display = f"@{username}" if username else "بدون يوزر"
             profile_link = f"https://t.me/{username}" if username else "لا يوجد رابط"
@@ -625,7 +620,7 @@ def handle_start_cmd(message):
 
     bot.send_message(chat_id, welcome_text, reply_markup=reply_kb)
 
-    # رسالة معلومات المستخدم والاشتراك (في رسالة منفصلة)
+    # رسالة معلومات المستخدم والاشتراك
     username_display = f"@{username}" if username else "لا يوجد"
     info_text = (
         "ℹ️ <b>معلومات حسابك في البوت</b>\n\n"
@@ -702,7 +697,7 @@ def handle_photo(message):
     bot.reply_to(message, "📷 تم استلام الصورة، ولكن لا يوجد طلب اشتراك قيد المراجعة حالياً.")
 
 
-@bot.message_handler(func=lambda m: m.text is not None and m.chat.id != ADMIN_ID)
+@bot.message_handler(func=lambda m: m.text is not None)
 def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
@@ -755,8 +750,10 @@ def handle_text(message):
         return
 
     if text == "🛠 لوحة التحكم":
-        # هذه الرسالة لن تمر هنا للأدمن، لأن الأدمن له هاندلر خاص
-        bot.reply_to(message, "❌ هذه اللوحة مخصصة للإدارة فقط.")
+        if not is_admin(chat_id):
+            bot.reply_to(message, "❌ هذه اللوحة مخصصة للإدارة فقط.")
+            return
+        show_admin_panel(chat_id)
         return
 
     # لو أرسل رابط يوتيوب مباشرة في أي وقت -> نبدأ القص (إن كان مشتركاً)
@@ -862,7 +859,6 @@ def handle_text(message):
             return
 
         if not heights:
-            # نفس الشيء: لو ما وجد أي جودة "مع صوت"
             session["quality_height"] = 360
             session["step"] = "choose_mode"
             bot.send_message(
@@ -918,7 +914,7 @@ def ask_video_or_audio(chat_id: int):
     )
     bot.send_message(
         chat_id,
-        "🎛️ <b>اختر نوع الملف الذي تريده:</b>",
+        "🎚️ <b>اختر نوع الملف الذي تريده:</b>",
         reply_markup=markup
     )
 
@@ -1005,14 +1001,14 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "الباقة غير معروفة.", show_alert=True)
             return
 
-        chat_id_user = call.from_user.id
-        session = user_sessions.setdefault(chat_id_user, {})
+        chat_id = call.from_user.id
+        session = user_sessions.setdefault(chat_id, {})
         session["pending_plan"] = plan_key
         session["step"] = "await_payment_proof"
 
         bot.answer_callback_query(call.id, f"تم اختيار الباقة: {plan['name']}")
         bot.send_message(
-            chat_id_user,
+            chat_id,
             "📸 الآن أرسل لقطة شاشة لإشعار الدفع ليتم مراجعة طلبك وتفعيل الاشتراك."
         )
         return
@@ -1111,8 +1107,6 @@ def handle_callbacks(call):
 
 def show_admin_panel(chat_id: int):
     """عرض لوحة التحكم للأدمن"""
-
-    # لوحة التحكم الأساسية (Reply Keyboard)
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add(
         KeyboardButton("✂️ قص مقطع يوتيوب"),
@@ -1124,25 +1118,20 @@ def show_admin_panel(chat_id: int):
     bot.send_message(
         chat_id,
         "🛠 <b>لوحة التحكم الإدارية</b>\n"
-        "اختر الإجراء المطلوب:",
+        "اختر الإجراء المطلوب من الأزرار التالية:",
         reply_markup=markup
     )
 
-    # لوحة التحكم الداخلية (Inline)
+    # لوحة داخلية بأزرار إنلاين
     inline = InlineKeyboardMarkup()
     inline.row(
         InlineKeyboardButton("✅ تفعيل اشتراك", callback_data="admin_activate"),
         InlineKeyboardButton("⛔ إلغاء اشتراك", callback_data="admin_cancel"),
     )
     inline.row(
-        InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats")
+        InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
     )
-
-    bot.send_message(
-        chat_id,
-        "🔽 اختر أحد الإجراءات التالية:",
-        reply_markup=inline
-    )
+    bot.send_message(chat_id, "اختر من لوحة التحكم:", reply_markup=inline)
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ["admin_activate", "admin_cancel", "admin_stats"])
@@ -1273,7 +1262,6 @@ def start_cutting(chat_id: int):
                         caption=f"🎬 الجزء {idx}/{total_parts}",
                     )
                 except ApiTelegramException as e:
-                    # لو ظهر خطأ حجم كبير جداً من تيليجرام
                     if "413" in str(e) or "Request Entity Too Large" in str(e):
                         bot.send_message(
                             chat_id,
@@ -1285,7 +1273,6 @@ def start_cutting(chat_id: int):
                             chat_id,
                             f"❌ خطأ من تيليجرام أثناء إرسال الجزء {idx}:\n<code>{e}</code>"
                         )
-                    # نستمر في حذف الملفات على أي حال
                     break
 
         bot.send_message(
@@ -1293,7 +1280,6 @@ def start_cutting(chat_id: int):
             "✅ انتهى إرسال المقطع.\n"
             "يمكنك الآن إرسال رابط يوتيوب جديد لقص مقطع آخر 🎯."
         )
-        # بعد الانتهاء نضع الحالة إلى await_url
         reset_session(chat_id)
 
     except DownloadError as e:
@@ -1310,24 +1296,23 @@ def start_cutting(chat_id: int):
             "❌ حدث خطأ غير متوقع أثناء القص أو التحميل."
         )
     finally:
-        # تنظيف الملفات المؤقتة
         try:
             clean_files(input_file, cut_file, audio_file, *parts)
         except Exception:
             pass
 
 
-# ================ معالجة إدخال ID في لوحة التحكم (للأدمن فقط) ================
+# ================ معالجة إدخال ID في لوحة التحكم ================
 
 @bot.message_handler(func=lambda m: m.text is not None and m.chat.id == ADMIN_ID)
 def handle_admin_text_extra(message):
-    """معالجة نصوص إضافية للأدمن (ID للتفعيل/الإلغاء) + بقية الاستخدام كأي مستخدم"""
+    """معالجة نصوص إضافية للأدمن (ID للتفعيل/الإلغاء)"""
     chat_id = message.chat.id
     session = user_sessions.get(chat_id) or {}
     step = session.get("step")
 
-    # تفعيل اشتراك لباقته المختارة من لوحة التحكم
     if step == "admin_wait_user_id":
+        # تفعيل اشتراك لباقته المختارة
         plan_key = session.get("admin_chosen_plan")
         plan = PLANS.get(plan_key) if plan_key else None
         if not plan:
@@ -1360,7 +1345,6 @@ def handle_admin_text_extra(message):
         user_sessions[chat_id] = session
         return
 
-    # إلغاء اشتراك من لوحة التحكم
     if step == "admin_cancel_wait_id":
         try:
             target_id = int(message.text.strip())
@@ -1385,7 +1369,7 @@ def handle_admin_text_extra(message):
         user_sessions[chat_id] = session
         return
 
-    # لو لم يكن في خطوة إدارية خاصة، نسمح له باستخدام البوت كأي مستخدم
+    # إن لم يكن في خطوة إدارية خاصة، نترك المعالجة للهاندلر الأساسي
     handle_text(message)
 
 
@@ -1399,6 +1383,5 @@ if __name__ == "__main__":
             bot.infinity_polling(skip_pending=True, timeout=60)
         except Exception as e:
             logger.error("Polling error from Telegram: %s", e)
-            # ملاحظة: لو ظهر خطأ 409 فهذا يعني أن هناك نسخة أخرى من البوت تعمل بنفس التوكن
-            # يجب إيقاف أي Instance أخرى للبوت (في Koyeb أو أي مكان آخر).
+            # لو ظهر خطأ 409 فهذا يعني أن هناك نسخة أخرى من البوت تعمل بنفس التوكن
             time.sleep(5)
