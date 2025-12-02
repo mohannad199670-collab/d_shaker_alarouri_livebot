@@ -1384,3 +1384,13 @@ def handle_admin_text_extra(message):
 
     # إن لم يكن في خطوة إدارية خاصة، نمرره للهاندلر الأساسي
     handle_text(message)
+
+# ================ تشغيل البوت مع معالجة أخطاء polling =================
+if __name__ == "__main__":
+    logger.info("🔥 Bot is running…")
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60)
+        except Exception as e:
+            logger.error("Polling error from Telegram: %s", e)
+            time.sleep(5)
