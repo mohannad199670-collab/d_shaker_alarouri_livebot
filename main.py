@@ -1,10 +1,10 @@
 import os
 import math
 import time
+import json
 import logging
 import subprocess
-import json
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
 import telebot
 from telebot.types import (
@@ -25,258 +25,332 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= إعداد التوكن و ID الأدمن =================
+# ================ إعداد التوكن و ID الأدمن ================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN غير موجود في Environment variables")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
-if not ADMIN_ID:
-    logger.warning("⚠️ لم يتم ضبط ADMIN_ID، بعض ميزات لوحة التحكم لن تعمل بشكل صحيح")
+# ADMIN_ID من متغير البيئة إن وُجد، وإلا يستخدم ID الافتراضي (ID الخاص بك)
+ADMIN_ENV = os.getenv("ADMIN_ID", "").strip()
+try:
+    ADMIN_ID = int(ADMIN_ENV) if ADMIN_ENV else 604494923
+except ValueError:
+    ADMIN_ID = 604494923
+    logger.warning("⚠️ قيمة ADMIN_ID في البيئة غير صالحة، سيتم استخدام 604494923 كأدمن افتراضي")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ================= إعداد الكوكيز الخاصة بيوتيوب =================
+# ================ إعداد الكوكيز الخاصة بيوتيوب ================
 # متغير البيئة الذي تضع فيه هيدر الكوكيز الكامل:
 # مثال: SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...
 YT_COOKIES_HEADER = os.getenv("YT_COOKIES_HEADER", os.getenv("YT_COOKIES", "")).strip()
 
-# إلغاء استخدام ملف cookies.txt نهائياً (نحن الآن نستخدم الهيدر فقط)
+# إلغاء استخدام ملف cookies.txt نهائياً
 COOKIES_PATH = None
 
-# ================= إعدادات الحجم =================
+# ================ إعدادات الحجم =================
 MAX_TELEGRAM_MB = 48  # الحد المستهدف لكل جزء (تقريباً 48 ميغا)
 
-# ================= ملف الاشتراكات والإحصائيات =================
-DB_PATH = "subscriptions.json"
+# ================ ملف قاعدة البيانات البسيطة =================
+DB_FILE = "database.json"
+
+DEFAULT_DB = {
+    "users": {},            # user_id(str) -> user_data
+    "visitors_today": 0,
+    "last_reset_date": "",  # "YYYY-MM-DD"
+}
 
 
 def load_db():
-    """قراءة قاعدة بيانات الاشتراكات من ملف JSON."""
-    if not os.path.exists(DB_PATH):
-        base = {
-            "users": {},  # user_id -> info
-            "stats": {
-                "total_visitors": 0,
-                "total_subscribers": 0,
-                "visitors_by_date": {},  # "YYYY-MM-DD": count
-                "last_subscribers": [],  # آخر 20 مشترك
-            },
-            "pending": {},  # طلبات اشتراك معلّقة: user_id -> {plan_name, days}
+    if not os.path.exists(DB_FILE):
+        return DEFAULT_DB.copy()
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # تأمين المفاتيح الأساسية
+        for k, v in DEFAULT_DB.items():
+            if k not in data:
+                data[k] = v
+        return data
+    except Exception as e:
+        logger.error("Error loading DB, using default: %s", e)
+        return DEFAULT_DB.copy()
+
+
+def save_db(db):
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Error saving DB: %s", e)
+
+
+def today_str() -> str:
+    return date.today().isoformat()
+
+
+def ensure_daily_reset(db):
+    t = today_str()
+    if db.get("last_reset_date") != t:
+        db["visitors_today"] = 0
+        db["last_reset_date"] = t
+
+
+def ensure_user(db, user_id: int, first_name: str, username: str):
+    """إنشاء/تحديث سجل المستخدم في قاعدة البيانات"""
+    uid = str(user_id)
+    users = db.setdefault("users", {})
+    user = users.get(uid) or {}
+    user.setdefault("subscription", None)  # أو dict
+    user.setdefault("total_visits", 0)
+    user.setdefault("joined_at", today_str())
+
+    user["first_name"] = first_name or ""
+    user["username"] = username or ""
+    user["last_seen"] = today_str()
+    user["total_visits"] = int(user.get("total_visits", 0)) + 1
+
+    users[uid] = user
+    db["users"] = users
+
+
+def register_visit(user_id: int, first_name: str, username: str):
+    """تسجيل زيارة مستخدم (يُستدعى في /start)"""
+    db = load_db()
+    ensure_daily_reset(db)
+    db["visitors_today"] = int(db.get("visitors_today", 0)) + 1
+    ensure_user(db, user_id, first_name, username)
+    save_db(db)
+
+
+# ================ نظام الإشتراكات ================
+
+PLANS = {
+    "p1": {"name": "شهر واحد", "days": 30},
+    "p3": {"name": "3 شهور", "days": 90},
+    "p6": {"name": "6 شهور", "days": 180},
+    "p12": {"name": "سنة كاملة", "days": 365},
+}
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+def get_user_record(user_id: int):
+    db = load_db()
+    uid = str(user_id)
+    return db["users"].get(uid)
+
+
+def set_user_record(user_id: int, record: dict):
+    db = load_db()
+    db["users"][str(user_id)] = record
+    save_db(db)
+
+
+def set_subscription(user_id: int, plan_key: str):
+    """تفعيل اشتراك للمستخدم حسب الخطة"""
+    if plan_key not in PLANS:
+        return
+
+    db = load_db()
+    uid = str(user_id)
+    users = db.setdefault("users", {})
+    user = users.get(uid) or {}
+    ensure_user(db, user_id, user.get("first_name", ""), user.get("username", ""))
+
+    plan = PLANS[plan_key]
+    today = date.today()
+    end_date = today + timedelta(days=plan["days"])
+
+    subscription = user.get("subscription") or {}
+    subscription.update(
+        {
+            "active": True,
+            "plan_key": plan_key,
+            "plan_name": plan["name"],
+            "days": plan["days"],
+            "start_date": today.isoformat(),
+            "end_date": end_date.isoformat(),
         }
-        save_db(base)
-        return base
+    )
+    user["subscription"] = subscription
+    users[uid] = user
+    db["users"] = users
+    save_db(db)
+
+
+def clear_subscription(user_id: int):
+    db = load_db()
+    uid = str(user_id)
+    users = db.setdefault("users", {})
+    user = users.get(uid)
+    if not user:
+        return
+    sub = user.get("subscription") or {}
+    sub.update(
+        {
+            "active": False,
+        }
+    )
+    user["subscription"] = sub
+    users[uid] = user
+    db["users"] = users
+    save_db(db)
+
+
+def _normalize_subscription(user_id: int):
+    """يتأكد من انتهاء الاشتراكات المنتهية تلقائياً"""
+    db = load_db()
+    uid = str(user_id)
+    user = db["users"].get(uid)
+    if not user:
+        return None
+
+    sub = user.get("subscription")
+    if not sub:
+        return None
+
+    end_str = sub.get("end_date")
+    if not end_str:
+        sub["active"] = False
+    else:
+        try:
+            end_d = date.fromisoformat(end_str)
+            if end_d < date.today():
+                sub["active"] = False
+        except Exception:
+            sub["active"] = False
+
+    user["subscription"] = sub
+    db["users"][uid] = user
+    save_db(db)
+    return sub
+
+
+def has_active_subscription(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    sub = _normalize_subscription(user_id)
+    return bool(sub and sub.get("active"))
+
+
+def subscription_status_text(user_id: int) -> str:
+    sub = _normalize_subscription(user_id)
+    if not sub or not sub.get("active"):
+        return "غير مشترك حالياً."
+
+    plan_name = sub.get("plan_name", "باقة غير معروفة")
+    end_str = sub.get("end_date", "")
+    days_total = sub.get("days", 0)
 
     try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        end_d = date.fromisoformat(end_str)
+        remaining = (end_d - date.today()).days
+        if remaining < 0:
+            remaining = 0
     except Exception:
-        # لو الملف تالف نعيد إنشاؤه
-        data = {
-            "users": {},
-            "stats": {
-                "total_visitors": 0,
-                "total_subscribers": 0,
-                "visitors_by_date": {},
-                "last_subscribers": [],
-            },
-            "pending": {},
-        }
-        save_db(data)
-    # ضمان المفاتيح الأساسية
-    data.setdefault("users", {})
-    data.setdefault("stats", {})
-    data["stats"].setdefault("total_visitors", 0)
-    data["stats"].setdefault("total_subscribers", 0)
-    data["stats"].setdefault("visitors_by_date", {})
-    data["stats"].setdefault("last_subscribers", [])
-    data.setdefault("pending", {})
-    return data
+        remaining = 0
+
+    return (
+        f"📦 الباقة الحالية: <b>{plan_name}</b>\n"
+        f"📅 تاريخ الانتهاء: <code>{end_str}</code>\n"
+        f"⏳ الأيام المتبقية: <b>{remaining}</b> يوم"
+    )
 
 
-def save_db(data):
-    """حفظ قاعدة البيانات في ملف JSON."""
-    with open(DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def get_stats_text() -> str:
+    db = load_db()
+    users = db.get("users", {})
+    total_visitors = len(users)
+
+    today_active = 0
+    total_active = 0
+    today_iso = today_str()
+
+    for uid, user in users.items():
+        sub = user.get("subscription") or {}
+        active = bool(sub.get("active"))
+        if active:
+            try:
+                end_d = date.fromisoformat(sub.get("end_date", today_iso))
+                if end_d < date.today():
+                    active = False
+            except Exception:
+                active = False
+
+        if active:
+            total_active += 1
+
+        # زائر اليوم (حسب last_seen)
+        if user.get("last_seen") == today_iso:
+            today_active += 1
+
+    visitors_today = db.get("visitors_today", 0)
+
+    return (
+        "📊 <b>إحصائيات البوت</b>\n\n"
+        f"👥 إجمالي الزوار: <b>{total_visitors}</b>\n"
+        f"🧑‍💻 إجمالي المشتركين: <b>{total_active}</b>\n"
+        f"📅 زوار اليوم (من قاعدة البيانات): <b>{visitors_today}</b>"
+    )
 
 
-db = load_db()
-
-# ================= إدارة جلسات المستخدم =================
+# ================ إدارة جلسات المستخدم =================
 # لكل مستخدم نخزن الحالة هنا
-# مثال:
 # {
 #   chat_id: {
-#       "step": "await_url" / "await_start" / "await_end" / "choose_quality" / "processing" / "await_payment_screenshot",
+#       "step": "...",
 #       "url": "...",
 #       "start": 10,
 #       "end": 120,
 #       "duration": 110,
 #       "quality_height": 360,
-#       "pending_plan": {"name": "شهر", "days": 30}
+#       "mode": "video" / "audio",
+#       "pending_plan": "p1" / "p3" / ...,
 #   }
 # }
 user_sessions = {}
 
-# جلسات خاصة بالأدمن (لتفعيل/إلغاء يدوي)
-admin_sessions = {}
-
 
 def reset_session(chat_id: int):
-    """إعادة تهيئة جلسة القص للمستخدم."""
+    """إعادة تهيئة جلسة المستخدم."""
     user_sessions[chat_id] = {
         "step": "await_url"
     }
 
 
-def get_today_str():
-    return datetime.utcnow().strftime("%Y-%m-%d")
+# ================ دوال مساعدة للواجهة ================
 
-
-def ensure_user_record(user_id: int, first_name: str, username: str | None):
-    """ضمان وجود سجل للمستخدم في قاعدة البيانات + تحديث الإحصائيات."""
-    global db
-    uid = str(user_id)
-    if uid not in db["users"]:
-        db["users"][uid] = {
-            "first_name": first_name or "",
-            "username": username or "",
-            "is_subscriber": False,
-            "plan_name": None,
-            "plan_days": 0,
-            "start_ts": None,
-            "end_ts": None,
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        # زيادة عدد الزوار الإجمالي مرة واحدة لكل مستخدم جديد
-        db["stats"]["total_visitors"] += 1
-
-    # تحديث الاسم واليوزر عند كل زيارة
-    db["users"][uid]["first_name"] = first_name or ""
-    db["users"][uid]["username"] = username or ""
-
-    # تحديث زوار اليوم
-    today = get_today_str()
-    db["stats"]["visitors_by_date"].setdefault(today, 0)
-    db["stats"]["visitors_by_date"][today] += 1
-
-    save_db(db)
-
-
-def is_user_subscriber(user_id: int) -> bool:
-    """التحقق هل المستخدم مشترك حالياً أم لا (حسب تاريخ الانتهاء)."""
-    uid = str(user_id)
-    info = db["users"].get(uid)
-    if not info:
-        return False
-    end_ts = info.get("end_ts")
-    if not end_ts:
-        return False
-    now_ts = time.time()
-    if now_ts > end_ts:
-        # انتهى الاشتراك، نحدّث الحالة
-        info["is_subscriber"] = False
-        save_db(db)
-        return False
-    info["is_subscriber"] = True
-    return True
-
-
-def get_user_subscription_text(user_id: int) -> str:
-    """إرجاع نص وصف حالة الاشتراك للمستخدم."""
-    uid = str(user_id)
-    info = db["users"].get(uid)
-    if not info or not info.get("end_ts"):
-        return "📌 حالة الاشتراك: <b>غير مفعّل</b>"
-
-    now_ts = time.time()
-    end_ts = info["end_ts"]
-    plan_name = info.get("plan_name") or "غير محددة"
-    plan_days = info.get("plan_days") or 0
-
-    if now_ts > end_ts:
-        return (
-            "📌 حالة الاشتراك: <b>منتهي</b>\n"
-            f"📦 الباقة السابقة: {plan_name} ({plan_days} يومًا)"
-        )
-
-    remaining_seconds = end_ts - now_ts
-    remaining_days = math.ceil(remaining_seconds / 86400)
-    end_date = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d")
-
-    return (
-        "📌 حالة الاشتراك: <b>فعّال</b>\n"
-        f"📦 الباقة الحالية: {plan_name} ({plan_days} يومًا)\n"
-        f"⏳ الأيام المتبقية: <b>{remaining_days}</b>\n"
-        f"📅 ينتهي بتاريخ: <b>{end_date}</b>"
+def build_main_keyboard(chat_id: int):
+    kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    kb.add(
+        KeyboardButton("✂️ قص مقطع يوتيوب"),
+        KeyboardButton("📦 الاشتراكات"),
     )
+    kb.add(KeyboardButton("⚙️ الإعدادات"))
+    if is_admin(chat_id):
+        kb.add(KeyboardButton("🛠 لوحة التحكم"))
+    return kb
 
 
-def activate_subscription(user_id: int, plan_name: str, days: int):
-    """تفعيل اشتراك لمستخدم لمدة معينة."""
-    global db
-    uid = str(user_id)
-    info = db["users"].setdefault(uid, {
-        "first_name": "",
-        "username": "",
-        "is_subscriber": False,
-        "plan_name": None,
-        "plan_days": 0,
-        "start_ts": None,
-        "end_ts": None,
-        "created_at": datetime.utcnow().isoformat(),
-    })
-
-    now = datetime.utcnow()
-    start_ts = time.time()
-    end_ts = start_ts + days * 86400
-
-    info["is_subscriber"] = True
-    info["plan_name"] = plan_name
-    info["plan_days"] = days
-    info["start_ts"] = start_ts
-    info["end_ts"] = end_ts
-
-    # إحصائيات المشتركين
-    db["stats"]["total_subscribers"] += 1
-    last_list = db["stats"]["last_subscribers"]
-    if uid in last_list:
-        last_list.remove(uid)
-    last_list.append(uid)
-    # نُبقي آخر 20 فقط
-    db["stats"]["last_subscribers"] = last_list[-20:]
-
-    save_db(db)
-    return info
+def build_plans_keyboard(for_admin_manual: bool = False):
+    """لوحة اختيار الباقات (تُستخدم للعميل وللأدمن)"""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("شهر واحد", callback_data="plan_p1_admin" if for_admin_manual else "plan_p1_user"),
+        InlineKeyboardButton("3 شهور", callback_data="plan_p3_admin" if for_admin_manual else "plan_p3_user"),
+    )
+    markup.row(
+        InlineKeyboardButton("6 شهور", callback_data="plan_p6_admin" if for_admin_manual else "plan_p6_user"),
+        InlineKeyboardButton("سنة كاملة", callback_data="plan_p12_admin" if for_admin_manual else "plan_p12_user"),
+    )
+    return markup
 
 
-def cancel_subscription(user_id: int):
-    """إلغاء اشتراك المستخدم (إن وجد)."""
-    global db
-    uid = str(user_id)
-    info = db["users"].get(uid)
-    if not info:
-        return False
-    info["is_subscriber"] = False
-    info["plan_name"] = None
-    info["plan_days"] = 0
-    info["start_ts"] = None
-    info["end_ts"] = None
-    save_db(db)
-    return True
+# ================ دوال قص الفيديو وتحميله ================
 
-
-def describe_user_brief(user_id: int) -> str:
-    """وصف مختصر للمستخدم (للاستخدام في رسائل الأدمن)."""
-    uid = str(user_id)
-    info = db["users"].get(uid, {})
-    first_name = info.get("first_name", "")
-    username = info.get("username", "")
-    uname_display = f"@{username}" if username else "بدون يوزر"
-    return f"👤 الاسم: {first_name}\n🆔 ID: <code>{uid}</code>\n🪪 اليوزر: {uname_display}"
-
-
-# ================= دوال مساعدة للقص والتحميل =================
 def extract_url(text: str) -> str:
     """يأخذ أول جزء يبدو كرابط من النص."""
     parts = text.split()
@@ -499,56 +573,7 @@ def clean_files(*paths):
             pass
 
 
-# ================= لوحات الأزرار =================
-
-def build_main_keyboard(is_admin: bool = False):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("✂️ قص مقطع"), KeyboardButton("📦 الاشتراكات"))
-    kb.row(KeyboardButton("⚙️ الإعدادات"))
-    if is_admin:
-        kb.row(KeyboardButton("🛠 لوحة التحكم"))
-    return kb
-
-
-def build_subscriptions_keyboard():
-    mk = InlineKeyboardMarkup()
-    mk.row(
-        InlineKeyboardButton("📅 شهر (30 يوم)", callback_data="plan_30_شهر"),
-        InlineKeyboardButton("📅 3 أشهر (90 يوم)", callback_data="plan_90_3 أشهر"),
-    )
-    mk.row(
-        InlineKeyboardButton("📅 6 أشهر (180 يوم)", callback_data="plan_180_6 أشهر"),
-        InlineKeyboardButton("📅 سنة (365 يوم)", callback_data="plan_365_سنة"),
-    )
-    return mk
-
-
-def build_admin_panel_keyboard():
-    mk = InlineKeyboardMarkup()
-    mk.row(
-        InlineKeyboardButton("✅ تفعيل اشتراك يدوي", callback_data="adm_manual_activate"),
-        InlineKeyboardButton("⛔️ إلغاء اشتراك يدوي", callback_data="adm_manual_cancel"),
-    )
-    mk.row(
-        InlineKeyboardButton("📊 الإحصائيات", callback_data="adm_stats"),
-    )
-    return mk
-
-
-def build_admin_stats_keyboard():
-    mk = InlineKeyboardMarkup()
-    mk.row(
-        InlineKeyboardButton("👥 إجمالي الزوار", callback_data="adm_stats_visitors"),
-        InlineKeyboardButton("⭐️ إجمالي المشتركين", callback_data="adm_stats_subscribers"),
-    )
-    mk.row(
-        InlineKeyboardButton("🆕 آخر 20 مشترك", callback_data="adm_stats_last"),
-        InlineKeyboardButton("📅 زوار اليوم", callback_data="adm_stats_today"),
-    )
-    return mk
-
-
-# ================= منطق البوت =================
+# ================ منطق البوت ================
 
 @bot.message_handler(commands=["start"])
 def handle_start_cmd(message):
@@ -558,17 +583,21 @@ def handle_start_cmd(message):
     first_name = user.first_name or ""
     username = user.username or ""
 
-    # حفظ المستخدم والإحصائيات
-    ensure_user_record(user_id, first_name, username)
+    # تسجيل الزيارة في قاعدة البيانات
+    register_visit(user_id, first_name, username)
 
-    # إرسال إشعار للأدمن عند دخول شخص جديد للبوت
-    if ADMIN_ID:
+    # إشعار للأدمن عند دخول مستخدم جديد /start
+    if is_admin(ADMIN_ID):
         try:
+            username_display = f"@{username}" if username else "بدون يوزر"
             profile_link = f"https://t.me/{username}" if username else "لا يوجد رابط"
+
             bot.send_message(
                 ADMIN_ID,
-                f"📥 <b>شخص دخل البوت الآن</b>\n\n"
-                f"{describe_user_brief(user_id)}\n"
+                f"📥 <b>دخول جديد للبوت</b>\n\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"👤 الاسم: {first_name}\n"
+                f"🪪 اليوزر: {username_display}\n"
                 f"🔗 الرابط: {profile_link}"
             )
         except Exception:
@@ -576,213 +605,164 @@ def handle_start_cmd(message):
 
     reset_session(chat_id)
 
-    sub_text = get_user_subscription_text(user_id)
-    is_admin = (user_id == ADMIN_ID)
+    # لوحة المفاتيح الرئيسية
+    reply_kb = build_main_keyboard(chat_id)
 
+    # رسالة ترحيب
     welcome_text = (
         "👋 أهلاً بك في بوت <b>قص مقاطع يوتيوب</b>.\n\n"
-        "هذا البوت يسمح لك باختيار مقطع من أي فيديو يوتيوب (عادي أو بث محفوظ)، "
-        "وتحميله بالجودة التي تختارها مباشرة من تيليجرام.\n\n"
-        "💳 لاستخدام خدمة القص يجب الاشتراك بإحدى الباقات المتاحة من زر <b>📦 الاشتراكات</b>.\n\n"
-        "ℹ️ ملاحظة: إذا تجاوز حجم الفيديو <b>48 ميغابايت</b> سيتم تقسيمه تلقائياً إلى عدة أجزاء وإرسالها لك بالتتابع.\n\n"
-        "🧾 <b>معلوماتك:</b>\n"
-        f"{describe_user_brief(user_id)}\n\n"
-        f"{sub_text}\n\n"
-        "اختر من الأزرار بالأسفل ما تريد القيام به 👇"
+        "✂️ يتيح لك البوت قص جزء محدد من أي فيديو (أو بث محفوظ) من يوتيوب "
+        "وإرساله لك بجودة تختارها.\n\n"
+        "🔒 لاستخدام البوت بشكل كامل، يرجى الاشتراك في إحدى الباقات من زر <b>📦 الاشتراكات</b>.\n\n"
+        "📌 ملاحظة: إذا تجاوز حجم الفيديو الناتج <b>48 ميغابايت</b> سيتم تقسيمه تلقائياً "
+        "إلى عدة أجزاء حسب طول المقطع والجودة."
     )
 
-    bot.send_message(
-        chat_id,
-        welcome_text,
-        reply_markup=build_main_keyboard(is_admin=is_admin)
+    bot.send_message(chat_id, welcome_text, reply_markup=reply_kb)
+
+    # رسالة معلومات المستخدم والاشتراك
+    username_display = f"@{username}" if username else "لا يوجد"
+    info_text = (
+        "ℹ️ <b>معلومات حسابك في البوت</b>\n\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"👤 الاسم: {first_name}\n"
+        f"🪪 اليوزر: {username_display}\n\n"
+        f"{subscription_status_text(user_id)}"
     )
+    bot.send_message(chat_id, info_text)
 
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
-    """
-    استقبال لقطة شاشة الدفع من العميل،
-    وإرسالها للأدمن مع زرّي: تفعيل الاشتراك / رفض الطلب.
-    """
+    """استقبال لقطة شاشة الدفع من العميل"""
     chat_id = message.chat.id
-    user = message.from_user
-    user_id = user.id
-
     session = user_sessions.get(chat_id, {})
-    pending_plan = session.get("pending_plan")
+    step = session.get("step")
 
-    # لو لم يكن هناك طلب باقة معلّق لهذا المستخدم، نتجاهل كونها صورة عادية
-    if not pending_plan:
-        bot.reply_to(message, "📸 تم استلام الصورة.\n(إن كنت تريد الاشتراك بالبوت، اختر أولاً باقة من زر «📦 الاشتراكات» ثم أرسل لقطة الدفع.)")
-        return
+    # إذا كان طالب اشتراك ويرسل لقطة
+    if step == "await_payment_proof" and session.get("pending_plan"):
+        plan_key = session.get("pending_plan")
+        plan = PLANS.get(plan_key)
+        if not plan:
+            bot.reply_to(message, "⚠️ حدث خطأ في تحديد الباقة، أعد الطلب من جديد من زر الاشتراكات.")
+            reset_session(chat_id)
+            return
 
-    plan_name = pending_plan["name"]
-    plan_days = pending_plan["days"]
+        user = message.from_user
+        user_id = user.id
+        first_name = user.first_name or ""
+        username = user.username or ""
+        username_display = f"@{username}" if username else "بدون يوزر"
+        profile_link = f"https://t.me/{username}" if username else "لا يوجد رابط"
 
-    # أخذ أعلى جودة من الصور المرسلة
-    file_id = message.photo[-1].file_id
-
-    # حفظ الطلب في قاعدة البيانات كطلب معلق
-    uid = str(user_id)
-    db["pending"][uid] = {
-        "plan_name": plan_name,
-        "plan_days": plan_days,
-        "ts": datetime.utcnow().isoformat(),
-    }
-    save_db(db)
-
-    # رسالة للعميل
-    bot.reply_to(
-        message,
-        "✅ تم استلام لقطة شاشة الدفع.\n"
-        "📡 سيتم مراجعة طلبك من قِبل الإدارة، وستصلك رسالة عند تفعيل الباقة أو رفض الطلب."
-    )
-
-    # إرسال الصورة للأدمن مع بيانات الطلب
-    if ADMIN_ID:
-        caption = (
-            "💰 <b>طلب اشتراك جديد</b>\n\n"
-            f"{describe_user_brief(user_id)}\n\n"
-            f"📦 الباقة المطلوبة: <b>{plan_name}</b> ({plan_days} يومًا)\n"
-        )
-        mk = InlineKeyboardMarkup()
-        mk.row(
-            InlineKeyboardButton("✅ تفعيل الاشتراك", callback_data=f"payok:{user_id}"),
-            InlineKeyboardButton("❌ رفض الطلب", callback_data=f"payno:{user_id}"),
-        )
+        # إرسال الصورة للأدمن مع أزرار قبول/رفض
         try:
+            caption = (
+                "🧾 <b>طلب اشتراك جديد</b>\n\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"👤 الاسم: {first_name}\n"
+                f"🪪 اليوزر: {username_display}\n"
+                f"🔗 الرابط: {profile_link}\n\n"
+                f"📦 الباقة المطلوبة: <b>{plan['name']}</b>\n"
+                f"⏳ مدة الباقة: <b>{plan['days']}</b> يوم"
+            )
+
+            markup = InlineKeyboardMarkup()
+            markup.row(
+                InlineKeyboardButton("✅ تفعيل الاشتراك", callback_data=f"payok|{user_id}|{plan_key}"),
+                InlineKeyboardButton("❌ رفض الطلب", callback_data=f"payno|{user_id}|{plan_key}"),
+            )
+
+            file_id = message.photo[-1].file_id
             bot.send_photo(
                 ADMIN_ID,
                 file_id,
                 caption=caption,
-                reply_markup=mk
+                reply_markup=markup,
             )
         except Exception as e:
-            logger.error("Error sending payment photo to admin: %s", e)
+            logger.error("Error sending payment proof to admin: %s", e)
 
-    # إزالة حالة الانتظار من جلسة المستخدم، لكن نترك طلبه في db["pending"]
-    session["pending_plan"] = None
-    user_sessions[chat_id] = session
+        bot.reply_to(
+            message,
+            "✅ تم استلام لقطة شاشة الدفع.\n"
+            "📡 سيتم مراجعة طلبك من قبل الإدارة، وستصلك رسالة عند تفعيل الباقة أو رفض الطلب."
+        )
+
+        # إعادة الجلسة للوضع الافتراضي
+        reset_session(chat_id)
+        return
+
+    # إن لم نكن بمرحلة الدفع، نتجاهل الصورة أو نرسل رسالة بسيطة
+    bot.reply_to(message, "📷 تم استلام الصورة، ولكن لا يوجد طلب اشتراك قيد المراجعة حالياً.")
 
 
 @bot.message_handler(func=lambda m: m.text is not None)
 def handle_text(message):
     chat_id = message.chat.id
-    user = message.from_user
-    user_id = user.id
     text = message.text.strip()
 
-    # معالجة أوضاع الأدمن اليدوية أولاً
-    if user_id == ADMIN_ID and user_id in admin_sessions:
-        adm_state = admin_sessions.get(user_id, {})
-        mode = adm_state.get("mode")
-
-        if mode == "await_manual_id_for_activate":
-            # تفعيل اشتراك يدوي: استلام ID
-            try:
-                target_id = int(text)
-            except ValueError:
-                bot.reply_to(message, "⚠️ أرسل ID صحيح مكون من أرقام فقط.")
-                return
-            adm_state["target_user_id"] = target_id
-            adm_state["mode"] = "await_manual_plan_for_activate"
-            admin_sessions[user_id] = adm_state
-
-            mk = build_subscriptions_keyboard()
-            bot.reply_to(
-                message,
-                "📦 اختر الباقة التي تريد تفعيلها لهذا المستخدم:",
-                reply_markup=mk
-            )
-            return
-
-        if mode == "await_manual_id_for_cancel":
-            # إلغاء اشتراك يدوي: استلام ID
-            try:
-                target_id = int(text)
-            except ValueError:
-                bot.reply_to(message, "⚠️ أرسل ID صحيح مكون من أرقام فقط.")
-                return
-
-            ok = cancel_subscription(target_id)
-            if ok:
-                bot.reply_to(
-                    message,
-                    f"✅ تم إلغاء اشتراك المستخدم:\n<code>{target_id}</code>"
-                )
-                try:
-                    bot.send_message(
-                        target_id,
-                        "⛔️ تم إلغاء اشتراكك في البوت بواسطة الإدارة."
-                    )
-                except Exception:
-                    pass
-            else:
-                bot.reply_to(message, "⚠️ هذا المستخدم غير موجود أو لا يملك اشتراكاً فعالاً.")
-            admin_sessions.pop(user_id, None)
-            return
-
-    # أوامر سابقة مثل /start تعالج في هندلر آخر
+    # الأوامر النصية الخاصة
     if text.startswith("/"):
         return
 
-    # مفاتيح القائمة الرئيسية
-    if text == "📦 الاشتراكات":
-        sub_text = get_user_subscription_text(user_id)
-        msg = (
-            "📦 <b>باقات الاشتراك المتاحة</b>:\n\n"
-            f"{sub_text}\n\n"
-            "🪙 اختر الباقة المناسبة لك من الأزرار بالأسفل، "
-            "ثم أرسل لقطة شاشة لإشعار الدفع عند طلب البوت لذلك."
-        )
-        bot.send_message(
-            chat_id,
-            msg,
-            reply_markup=build_subscriptions_keyboard()
-        )
-        return
-
-    if text == "⚙️ الإعدادات":
-        info_text = (
-            "⚙️ <b>الإعدادات ومعلومات حسابك</b>\n\n"
-            f"{describe_user_brief(user_id)}\n\n"
-            f"{get_user_subscription_text(user_id)}"
-        )
-        bot.send_message(chat_id, info_text)
-        return
-
-    if text == "🛠 لوحة التحكم" and user_id == ADMIN_ID:
-        bot.send_message(
-            chat_id,
-            "🛠 <b>لوحة تحكم الأدمن</b>\n\n"
-            "اختر ما تريد من الأزرار:",
-            reply_markup=build_admin_panel_keyboard()
-        )
-        return
-
-    if text == "✂️ قص مقطع":
-        # فتح وضع القص (يتطلب اشتراك)
-        if not is_user_subscriber(user_id):
-            bot.send_message(
-                chat_id,
-                "⛔️ هذا البوت مدفوع.\n"
-                "يرجى الاشتراك بإحدى الباقات من زر <b>📦 الاشتراكات</b> لاستخدام خدمة قص المقاطع."
+    # لوحة المفاتيح الرئيسية
+    if text == "✂️ قص مقطع يوتيوب":
+        if not has_active_subscription(chat_id):
+            bot.reply_to(
+                message,
+                "🔒 لا يمكنك استخدام خدمة القص حالياً.\n"
+                "يرجى الاشتراك من زر <b>📦 الاشتراكات</b> أولاً."
             )
             return
         reset_session(chat_id)
         bot.send_message(
             chat_id,
-            "🎬 أرسل الآن رابط فيديو يوتيوب (عادي أو بث محفوظ) لبدء عملية القص."
+            "🔗 أرسل الآن رابط فيديو يوتيوب (عادي أو بث محفوظ) لبدء عملية القص.",
         )
         return
 
-    # لو أرسل رابط يوتيوب مباشرة
+    if text == "📦 الاشتراكات":
+        user_id = message.from_user.id
+        status = subscription_status_text(user_id)
+        bot.send_message(
+            chat_id,
+            f"{status}\n\n"
+            "🧾 <b>اختر الباقة التي ترغب بها:</b>",
+            reply_markup=build_plans_keyboard(for_admin_manual=False),
+        )
+        return
+
+    if text == "⚙️ الإعدادات":
+        user = message.from_user
+        user_id = user.id
+        first_name = user.first_name or ""
+        username = user.username or ""
+        username_display = f"@{username}" if username else "لا يوجد"
+        info_text = (
+            "⚙️ <b>إعدادات حسابك</b>\n\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"👤 الاسم: {first_name}\n"
+            f"🪪 اليوزر: {username_display}\n\n"
+            f"{subscription_status_text(user_id)}"
+        )
+        bot.send_message(chat_id, info_text)
+        return
+
+    if text == "🛠 لوحة التحكم":
+        if not is_admin(chat_id):
+            bot.reply_to(message, "❌ هذه اللوحة مخصصة للإدارة فقط.")
+            return
+        show_admin_panel(chat_id)
+        return
+
+    # لو أرسل رابط يوتيوب مباشرة في أي وقت -> نبدأ القص (إن كان مشتركاً)
     if "youtu.be" in text or "youtube.com" in text:
-        if not is_user_subscriber(user_id):
-            bot.send_message(
-                chat_id,
-                "⛔️ هذا البوت مدفوع.\n"
-                "يرجى الاشتراك بإحدى الباقات من زر <b>📦 الاشتراكات</b> أولاً."
+        if not has_active_subscription(chat_id):
+            bot.reply_to(
+                message,
+                "🔒 لا يمكنك استخدام خدمة القص حالياً.\n"
+                "يرجى الاشتراك من زر <b>📦 الاشتراكات</b> أولاً."
             )
             return
 
@@ -790,7 +770,6 @@ def handle_text(message):
         user_sessions[chat_id] = {
             "step": "await_start",
             "url": url,
-            "pending_plan": user_sessions.get(chat_id, {}).get("pending_plan"),
         }
         bot.reply_to(
             message,
@@ -802,12 +781,12 @@ def handle_text(message):
         )
         return
 
-    # إن لم تكن جلسة موجودة، نطلب منه /start أو زر قص مقطع
+    # من هنا وما بعده نتعامل مع خطوات القص
     session = user_sessions.get(chat_id)
     if not session:
         bot.reply_to(
             message,
-            "⚠️ أرسل أولاً /start أو استخدم زر «✂️ قص مقطع» ثم أرسل رابط يوتيوب."
+            "⚠️ أرسل أولاً رابط فيديو يوتيوب أو استخدم زر <b>✂️ قص مقطع يوتيوب</b>."
         )
         return
 
@@ -820,7 +799,6 @@ def handle_text(message):
         url = extract_url(text)
         session["url"] = url
         session["step"] = "await_start"
-        user_sessions[chat_id] = session
         bot.reply_to(
             message,
             "⏱️ أرسل وقت <b>البداية</b> بصيغة مثل:\n"
@@ -836,7 +814,6 @@ def handle_text(message):
 
         session["start"] = start_seconds
         session["step"] = "await_end"
-        user_sessions[chat_id] = session
         bot.reply_to(
             message,
             "⏱️ الآن أرسل وقت <b>النهاية</b> لنقطة القص بنفس الصيغ السابقة.\n"
@@ -861,7 +838,6 @@ def handle_text(message):
         duration = end_seconds - start_seconds
         session["end"] = end_seconds
         session["duration"] = duration
-        user_sessions[chat_id] = session
 
         # الآن فحص الجودات
         bot.reply_to(message, "⏳ يتم فحص الجودات المتاحة للفيديو…")
@@ -871,33 +847,33 @@ def handle_text(message):
             heights = get_available_qualities(video_url)
         except Exception as e:
             logger.error("Error getting qualities from YouTube", exc_info=e)
+            # لو فشل الفحص، نستخدم 360p افتراضياً
             session["quality_height"] = 360
-            session["step"] = "processing"
-            user_sessions[chat_id] = session
+            session["step"] = "choose_mode"
             bot.send_message(
                 chat_id,
                 "❌ حدث خطأ أثناء فحص الجودات من يوتيوب.\n"
                 "سيتم استخدام جودة <b>360p</b> افتراضياً."
             )
-            start_cutting(chat_id)
+            ask_video_or_audio(chat_id)
             return
 
         if not heights:
             session["quality_height"] = 360
-            session["step"] = "processing"
-            user_sessions[chat_id] = session
+            session["step"] = "choose_mode"
             bot.send_message(
                 chat_id,
                 "⚠️ لم أجد جودات قياسية (144p–1080p) مع صوت.\n"
                 "سيتم استخدام جودة <b>360p</b> افتراضياً."
             )
-            start_cutting(chat_id)
+            ask_video_or_audio(chat_id)
             return
 
+        # حفظ أن لدينا جودات متاحة
         session["available_heights"] = heights
         session["step"] = "choose_quality"
-        user_sessions[chat_id] = session
 
+        # إنشاء أزرار حسب الجودات الموجودة فعلاً
         markup = InlineKeyboardMarkup()
         row = []
         for h in [144, 240, 360, 480, 720, 1080]:
@@ -916,55 +892,284 @@ def handle_text(message):
             reply_markup=markup
         )
 
-    elif step in ("choose_quality", "processing"):
+    elif step in ("choose_quality", "choose_mode", "processing"):
         bot.reply_to(
             message,
-            "⌛ يتم حالياً تجهيز المقطع.\n"
+            "⌛ يتم حالياً تجهيز المقطع أو انتظار اختيار الجودة/نوع الملف.\n"
             "انتظر حتى ينتهي أو أرسل رابط يوتيوب جديد لبدء عملية جديدة."
         )
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("q_"))
-def handle_quality_callback(call):
-    chat_id = call.message.chat.id
+def ask_video_or_audio(chat_id: int):
+    """سؤال المستخدم: هل يريد فيديو أم صوت فقط؟"""
     session = user_sessions.get(chat_id)
-
     if not session:
-        bot.answer_callback_query(call.id, "انتهت الجلسة، أرسل رابطاً جديداً.", show_alert=True)
         return
 
-    try:
-        height = int(call.data.split("_")[1])
-    except Exception:
-        bot.answer_callback_query(call.id, "⚠️ خطأ في اختيار الجودة.", show_alert=True)
-        return
+    session["step"] = "choose_mode"
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("🎬 فيديو", callback_data="mode_video"),
+        InlineKeyboardButton("🎧 صوت", callback_data="mode_audio"),
+    )
+    bot.send_message(
+        chat_id,
+        "🎚️ <b>اختر نوع الملف الذي تريده:</b>",
+        reply_markup=markup
+    )
 
-    available_heights = session.get("available_heights") or []
-    if height not in available_heights:
-        bot.answer_callback_query(call.id, "⚠️ هذه الجودة غير متاحة لهذا الفيديو.", show_alert=True)
-        return
 
-    session["quality_height"] = height
-    session["step"] = "processing"
-    user_sessions[chat_id] = session
+# ========== كولباكات الاشتراكات والجودات وأنواع الملفات وطلبات الدفع ==========
 
-    bot.answer_callback_query(call.id, f"تم اختيار الجودة: {height}p ✅", show_alert=False)
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    chat_id = call.message.chat.id
+    data = call.data or ""
 
-    try:
-        bot.edit_message_text(
-            f"✅ تم اختيار الجودة: <b>{height}p</b>\n"
-            "سيتم الآن تحميل الفيديو وقص المقطع وإرساله…",
-            chat_id=chat_id,
-            message_id=call.message.message_id
+    # أولاً: كولباكات الدفع (تفعيل/رفض من الأدمن)
+    if data.startswith("payok|") or data.startswith("payno|"):
+        if not is_admin(chat_id):
+            bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
+            return
+
+        try:
+            action, user_id_str, plan_key = data.split("|", 2)
+            target_id = int(user_id_str)
+        except Exception:
+            bot.answer_callback_query(call.id, "بيانات الطلب غير صالحة.", show_alert=True)
+            return
+
+        plan = PLANS.get(plan_key)
+        if not plan:
+            bot.answer_callback_query(call.id, "الباقة غير معروفة.", show_alert=True)
+            return
+
+        if action == "payok":
+            set_subscription(target_id, plan_key)
+            status = subscription_status_text(target_id)
+            # رسالة للعميل
+            try:
+                bot.send_message(
+                    target_id,
+                    "✅ تم تفعيل اشتراكك بنجاح.\n\n" + status
+                )
+            except Exception:
+                pass
+
+            # تعديل رسالة الأدمن
+            try:
+                bot.edit_message_caption(
+                    caption=call.message.caption + "\n\n✅ <b>تم تفعيل الاشتراك لهذا المستخدم.</b>",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                )
+            except Exception:
+                pass
+
+            bot.answer_callback_query(call.id, "تم تفعيل الاشتراك 👍")
+            return
+
+        elif action == "payno":
+            # رسالة للعميل
+            try:
+                bot.send_message(
+                    target_id,
+                    "❌ تم رفض طلب الاشتراك.\n"
+                    "السبب: لم يتم تأكيد عملية الدفع من قبل الإدارة."
+                )
+            except Exception:
+                pass
+
+            # تعديل رسالة الأدمن
+            try:
+                bot.edit_message_caption(
+                    caption=call.message.caption + "\n\n❌ <b>تم رفض هذا الطلب.</b>",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                )
+            except Exception:
+                pass
+
+            bot.answer_callback_query(call.id, "تم رفض الطلب.")
+            return
+
+    # ثانياً: كولباكات اختيار الباقة للعميل
+    if data.startswith("plan_") and data.endswith("_user"):
+        plan_key = data[5:-5]  # بين "plan_" و "_user"
+        plan = PLANS.get(plan_key)
+        if not plan:
+            bot.answer_callback_query(call.id, "الباقة غير معروفة.", show_alert=True)
+            return
+
+        chat_id = call.from_user.id
+        session = user_sessions.setdefault(chat_id, {})
+        session["pending_plan"] = plan_key
+        session["step"] = "await_payment_proof"
+
+        bot.answer_callback_query(call.id, f"تم اختيار الباقة: {plan['name']}")
+        bot.send_message(
+            chat_id,
+            "📸 الآن أرسل لقطة شاشة لإشعار الدفع ليتم مراجعة طلبك وتفعيل الاشتراك."
         )
-    except Exception:
-        pass
+        return
 
-    start_cutting(chat_id)
+    # ثالثاً: كولباكات اختيار الباقة في لوحة التحكم (تفعيل يدوي)
+    if data.startswith("plan_") and data.endswith("_admin"):
+        if not is_admin(chat_id):
+            bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
+            return
+
+        plan_key = data[5:-6]  # بين "plan_" و "_admin"
+        plan = PLANS.get(plan_key)
+        if not plan:
+            bot.answer_callback_query(call.id, "الباقة غير معروفة.", show_alert=True)
+            return
+
+        admin_session = user_sessions.setdefault(chat_id, {})
+        admin_session["admin_chosen_plan"] = plan_key
+        admin_session["step"] = "admin_wait_user_id"
+
+        bot.answer_callback_query(call.id, f"تم اختيار الباقة: {plan['name']}")
+        bot.send_message(
+            chat_id,
+            "✏️ أرسل الآن <b>ID</b> المستخدم الذي تريد تفعيل هذه الباقة له."
+        )
+        return
+
+    # رابعاً: كولباكات اختيار الجودة
+    if data.startswith("q_"):
+        session = user_sessions.get(chat_id)
+        if not session:
+            bot.answer_callback_query(call.id, "انتهت الجلسة، أرسل رابطاً جديداً.", show_alert=True)
+            return
+
+        try:
+            height = int(data.split("_")[1])
+        except Exception:
+            bot.answer_callback_query(call.id, "⚠️ خطأ في اختيار الجودة.", show_alert=True)
+            return
+
+        available_heights = session.get("available_heights") or []
+        if height not in available_heights:
+            bot.answer_callback_query(call.id, "⚠️ هذه الجودة غير متاحة لهذا الفيديو.", show_alert=True)
+            return
+
+        session["quality_height"] = height
+        session["step"] = "choose_mode"
+
+        bot.answer_callback_query(call.id, f"تم اختيار الجودة: {height}p ✅", show_alert=False)
+
+        try:
+            bot.edit_message_text(
+                f"✅ تم اختيار الجودة: <b>{height}p</b>\n"
+                "الآن اختر نوع الملف الذي تريده:",
+                chat_id=chat_id,
+                message_id=call.message.message_id
+            )
+        except Exception:
+            pass
+
+        ask_video_or_audio(chat_id)
+        return
+
+    # خامساً: كولباكات اختيار نوع الملف (فيديو / صوت)
+    if data == "mode_video" or data == "mode_audio":
+        session = user_sessions.get(chat_id)
+        if not session:
+            bot.answer_callback_query(call.id, "انتهت الجلسة، أرسل رابطاً جديداً.", show_alert=True)
+            return
+
+        mode = "video" if data == "mode_video" else "audio"
+        session["mode"] = mode
+        session["step"] = "processing"
+
+        bot.answer_callback_query(
+            call.id,
+            "سيتم تجهيز المقطع كفيديو 🎬" if mode == "video" else "سيتم تجهيز المقطع كصوت فقط 🎧",
+            show_alert=False,
+        )
+
+        try:
+            bot.edit_message_text(
+                ("🎬 سيتم الآن تحميل الفيديو وقص المقطع وإرساله كفيديو…" if mode == "video"
+                 else "🎧 سيتم الآن تحميل الفيديو وقص المقطع وإرساله كصوت فقط…"),
+                chat_id=chat_id,
+                message_id=call.message.message_id
+            )
+        except Exception:
+            pass
+
+        start_cutting(chat_id)
+        return
+
+    bot.answer_callback_query(call.id)  # افتراضي
+
+
+def show_admin_panel(chat_id: int):
+    """عرض لوحة التحكم للأدمن"""
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("✂️ قص مقطع يوتيوب"),
+        KeyboardButton("📦 الاشتراكات"),
+    )
+    markup.add(KeyboardButton("⚙️ الإعدادات"))
+    markup.add(KeyboardButton("🛠 لوحة التحكم"))
+
+    bot.send_message(
+        chat_id,
+        "🛠 <b>لوحة التحكم الإدارية</b>\n"
+        "اختر الإجراء المطلوب من الأزرار التالية:",
+        reply_markup=markup
+    )
+
+    # لوحة داخلية بأزرار إنلاين
+    inline = InlineKeyboardMarkup()
+    inline.row(
+        InlineKeyboardButton("✅ تفعيل اشتراك", callback_data="admin_activate"),
+        InlineKeyboardButton("⛔ إلغاء اشتراك", callback_data="admin_cancel"),
+    )
+    inline.row(
+        InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
+    )
+    bot.send_message(chat_id, "اختر من لوحة التحكم:", reply_markup=inline)
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ["admin_activate", "admin_cancel", "admin_stats"])
+def handle_admin_panel_callbacks(call):
+    chat_id = call.message.chat.id
+    if not is_admin(chat_id):
+        bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
+        return
+
+    data = call.data
+    admin_session = user_sessions.setdefault(chat_id, {})
+
+    if data == "admin_activate":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "✅ اختر أولاً الباقة التي تريد تفعيلها للمستخدم:",
+            reply_markup=build_plans_keyboard(for_admin_manual=True),
+        )
+        return
+
+    if data == "admin_cancel":
+        bot.answer_callback_query(call.id)
+        admin_session["step"] = "admin_cancel_wait_id"
+        bot.send_message(
+            chat_id,
+            "⛔ أرسل الآن <b>ID</b> المستخدم الذي تريد إلغاء اشتراكه."
+        )
+        return
+
+    if data == "admin_stats":
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, get_stats_text())
+        return
 
 
 def start_cutting(chat_id: int):
-    """تحميل الفيديو، قص المقطع، تقسيمه لأجزاء مناسبة، وإرساله كفيديو."""
+    """تحميل الفيديو، قص المقطع، تقسيمه لأجزاء مناسبة، وإرساله كفيديو أو صوت."""
     session = user_sessions.get(chat_id)
     if not session:
         bot.send_message(chat_id, "⚠️ حصل خطأ في الجلسة. أرسل رابط يوتيوب من جديد.")
@@ -974,6 +1179,7 @@ def start_cutting(chat_id: int):
     start_seconds = session.get("start")
     duration = session.get("duration")
     quality_height = session.get("quality_height")
+    mode = session.get("mode", "video")
 
     if url is None or start_seconds is None or duration is None:
         bot.send_message(chat_id, "⚠️ بيانات الجلسة غير مكتملة. أرسل رابطاً جديداً.")
@@ -988,14 +1194,52 @@ def start_cutting(chat_id: int):
     input_file = None
     cut_file = None
     parts = []
+    audio_file = None
 
     try:
+        # تحميل الفيديو مع صوت
         input_file = download_video(url, quality_height, output_name="source")
         logger.info("Downloaded video file: %s", input_file)
 
+        # قص المقطع المطلوب
         cut_file = cut_video_range(input_file, start_seconds, duration, output_file="cut_full.mp4")
         logger.info("Cut file created: %s", cut_file)
 
+        if mode == "audio":
+            # تحويل إلى صوت فقط (m4a)
+            audio_file = "cut_audio.m4a"
+            command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                cut_file,
+                "-vn",
+                "-acodec",
+                "aac",
+                audio_file,
+            ]
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            if not os.path.exists(audio_file):
+                bot.send_message(chat_id, "❌ لم أستطع استخراج الصوت من المقطع.")
+                return
+
+            with open(audio_file, "rb") as f:
+                bot.send_audio(
+                    chat_id,
+                    f,
+                    caption="🎧 المقطع الصوتي الذي طلبته.",
+                )
+
+            bot.send_message(
+                chat_id,
+                "✅ انتهى إرسال المقطع.\n"
+                "يمكنك الآن إرسال رابط يوتيوب جديد لقص مقطع آخر 🎯."
+            )
+            reset_session(chat_id)
+            return
+
+        # تقسيم المقطع إلى أجزاء (فيديو)
         parts = split_video_to_parts(cut_file, max_mb=MAX_TELEGRAM_MB)
         logger.info("Parts to send: %s", parts)
 
@@ -1004,6 +1248,7 @@ def start_cutting(chat_id: int):
             bot.send_message(chat_id, "❌ لم أستطع استخراج المقطع بعد القص.")
             return
 
+        # إرسال الأجزاء كفيديو
         for idx, part in enumerate(parts, start=1):
             bot.send_message(
                 chat_id,
@@ -1042,7 +1287,7 @@ def start_cutting(chat_id: int):
         bot.send_message(
             chat_id,
             "❌ حدث خطأ أثناء تحميل الفيديو من يوتيوب.\n"
-            "تأكد أن رابط الفيديو يعمل، وأن متغير الكوكيز <b>YT_COOKIES_HEADER</b> (أو YT_COOKIES) صحيح ومحدث."
+            "تأكد أن رابط الفيديو يعمل، وأن متغير الكوكيز <b>YT_COOKIES_HEADER</b> (أو YT_COOKIES) صحيح ومحدّث."
         )
     except Exception as e:
         logger.error("Unexpected error in start_cutting", exc_info=e)
@@ -1052,229 +1297,91 @@ def start_cutting(chat_id: int):
         )
     finally:
         try:
-            clean_files(input_file, cut_file, *parts)
+            clean_files(input_file, cut_file, audio_file, *parts)
         except Exception:
             pass
 
 
-# ================= Callback لـ الباقات (اشتراك) =================
+# ================ معالجة إدخال ID في لوحة التحكم ================
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("plan_"))
-def handle_plan_callback(call):
-    chat_id = call.message.chat.id
-    user_id = call.from_user.id
+@bot.message_handler(func=lambda m: m.text is not None and m.chat.id == ADMIN_ID)
+def handle_admin_text_extra(message):
+    """معالجة نصوص إضافية للأدمن (ID للتفعيل/الإلغاء)"""
+    chat_id = message.chat.id
+    session = user_sessions.get(chat_id) or {}
+    step = session.get("step")
 
-    # data بالشكل "plan_30_شهر"
-    parts = call.data.split("_", 2)
-    if len(parts) < 3:
-        bot.answer_callback_query(call.id, "⚠️ خطأ في اختيار الباقة.", show_alert=True)
-        return
+    if step == "admin_wait_user_id":
+        # تفعيل اشتراك لباقته المختارة
+        plan_key = session.get("admin_chosen_plan")
+        plan = PLANS.get(plan_key) if plan_key else None
+        if not plan:
+            bot.reply_to(message, "⚠️ لم يتم اختيار باقة بعد، اختر الباقة أولاً من لوحة التحكم.")
+            return
 
-    try:
-        days = int(parts[1])
-    except ValueError:
-        bot.answer_callback_query(call.id, "⚠️ خطأ في الباقة.", show_alert=True)
-        return
-
-    plan_name = parts[2]
-    session = user_sessions.get(chat_id, {})
-    session["pending_plan"] = {"name": plan_name, "days": days}
-    user_sessions[chat_id] = session
-
-    bot.answer_callback_query(call.id, f"تم اختيار الباقة: {plan_name} ✅", show_alert=False)
-
-    try:
-        bot.edit_message_text(
-            f"📦 تم اختيار الباقة: <b>{plan_name}</b> ({days} يومًا)\n\n"
-            "📸 الآن أرسل لقطة شاشة لإشعار الدفع ليتم مراجعة طلبك وتفعيل الاشتراك.",
-            chat_id=chat_id,
-            message_id=call.message.message_id
-        )
-    except Exception:
-        pass
-
-
-# ================= Callback لطلبات الدفع (تفعيل/رفض) =================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("payok:") or call.data.startswith("payno:"))
-def handle_payment_decision(call):
-    global db
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "هذه الأزرار مخصصة للأدمن فقط.", show_alert=True)
-        return
-
-    data = call.data
-    if data.startswith("payok:"):
-        # تفعيل الاشتراك مباشرة
         try:
-            user_id = int(data.split(":", 1)[1])
+            target_id = int(message.text.strip())
         except ValueError:
-            bot.answer_callback_query(call.id, "⚠️ بيانات غير صالحة.", show_alert=True)
+            bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
             return
 
-        uid = str(user_id)
-        pending = db["pending"].get(uid)
-        if not pending:
-            bot.answer_callback_query(call.id, "⚠️ لا يوجد طلب معلق لهذا المستخدم.", show_alert=True)
-            return
-
-        plan_name = pending["plan_name"]
-        plan_days = pending["plan_days"]
-
-        info = activate_subscription(user_id, plan_name, plan_days)
-        db["pending"].pop(uid, None)
-        save_db(db)
-
-        # تعديل رسالة الأدمن (إن أمكن)
-        try:
-            bot.edit_message_caption(
-                caption=call.message.caption + "\n\n✅ تم تفعيل الاشتراك بنجاح.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-        except Exception:
-            pass
-
-        sub_text = get_user_subscription_text(user_id)
-
-        # رسالة للأدمن
-        bot.answer_callback_query(call.id, "✅ تم تفعيل الاشتراك.", show_alert=False)
-        bot.send_message(
-            ADMIN_ID,
-            f"✅ تم تفعيل اشتراك المستخدم:\n{describe_user_brief(user_id)}\n\n{sub_text}"
-        )
-
-        # رسالة للمستخدم
-        try:
-            bot.send_message(
-                user_id,
-                "🎉 تم تفعيل باقتك بنجاح.\n\n" + sub_text
-            )
-        except Exception as e:
-            logger.error("Error sending activation message to user: %s", e)
-
-    elif data.startswith("payno:"):
-        # رفض الطلب
-        try:
-            user_id = int(data.split(":", 1)[1])
-        except ValueError:
-            bot.answer_callback_query(call.id, "⚠️ بيانات غير صالحة.", show_alert=True)
-            return
-
-        uid = str(user_id)
-        pending = db["pending"].pop(uid, None)
-        save_db(db)
-
-        try:
-            bot.edit_message_caption(
-                caption=(call.message.caption or "") + "\n\n❌ تم رفض هذا الطلب.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-        except Exception:
-            pass
-
-        bot.answer_callback_query(call.id, "❌ تم رفض الطلب.", show_alert=False)
+        set_subscription(target_id, plan_key)
+        status = subscription_status_text(target_id)
 
         bot.send_message(
-            ADMIN_ID,
-            f"❌ تم رفض طلب الاشتراك للمستخدم:\n{describe_user_brief(user_id)}"
+            chat_id,
+            f"✅ تم تفعيل باقة <b>{plan['name']}</b> للمستخدم ID: <code>{target_id}</code>."
         )
         try:
             bot.send_message(
-                user_id,
-                "❌ تم إلغاء العملية بسبب عدم اكتمال الدفع أو وجود مشكلة في التحقق من الإشعار."
+                target_id,
+                "✅ تم تفعيل اشتراكك من قبل الإدارة.\n\n" + status
             )
         except Exception:
             pass
 
-
-# ================= Callback لوحة التحكم والإحصائيات =================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_"))
-def handle_admin_callbacks(call):
-    user_id = call.from_user.id
-    if user_id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "هذه الأزرار مخصصة للأدمن فقط.", show_alert=True)
+        session["step"] = None
+        session["admin_chosen_plan"] = None
+        user_sessions[chat_id] = session
         return
 
-    data = call.data
-
-    if data == "adm_manual_activate":
-        admin_sessions[user_id] = {"mode": "await_manual_id_for_activate"}
-        bot.answer_callback_query(call.id, "أرسل ID المستخدم لتفعيل اشتراكه.", show_alert=False)
-        bot.send_message(
-            user_id,
-            "🔑 أرسل الآن <b>ID</b> المستخدم الذي تريد تفعيل الاشتراك له:"
-        )
-
-    elif data == "adm_manual_cancel":
-        admin_sessions[user_id] = {"mode": "await_manual_id_for_cancel"}
-        bot.answer_callback_query(call.id, "أرسل ID المستخدم لإلغاء اشتراكه.", show_alert=False)
-        bot.send_message(
-            user_id,
-            "⛔️ أرسل الآن <b>ID</b> المستخدم الذي تريد إلغاء اشتراكه:"
-        )
-
-    elif data == "adm_stats":
-        bot.answer_callback_query(call.id, "إحصائيات البوت", show_alert=False)
-        bot.send_message(
-            user_id,
-            "📊 اختر نوع الإحصائية:",
-            reply_markup=build_admin_stats_keyboard()
-        )
-
-    elif data == "adm_stats_visitors":
-        bot.answer_callback_query(call.id, "إجمالي الزوار", show_alert=False)
-        total = db["stats"].get("total_visitors", 0)
-        bot.send_message(
-            user_id,
-            f"👥 <b>إجمالي عدد زوار البوت:</b> {total}"
-        )
-
-    elif data == "adm_stats_subscribers":
-        bot.answer_callback_query(call.id, "إجمالي المشتركين", show_alert=False)
-        total = db["stats"].get("total_subscribers", 0)
-        bot.send_message(
-            user_id,
-            f"⭐️ <b>إجمالي عدد الاشتراكات المُفعّلة (مع إعادة الاشتراك):</b> {total}"
-        )
-
-    elif data == "adm_stats_last":
-        bot.answer_callback_query(call.id, "آخر المشتركين", show_alert=False)
-        last_list = db["stats"].get("last_subscribers", [])
-        if not last_list:
-            bot.send_message(user_id, "🆕 لا يوجد مشتركين بعد.")
+    if step == "admin_cancel_wait_id":
+        try:
+            target_id = int(message.text.strip())
+        except ValueError:
+            bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
             return
-        lines = []
-        for uid in reversed(last_list):  # آخر واحد في الأسفل
-            try:
-                uid_int = int(uid)
-            except ValueError:
-                continue
-            lines.append(describe_user_brief(uid_int))
-        text = "🆕 <b>آخر المشتركين في البوت (بحد أقصى 20):</b>\n\n" + "\n\n".join(lines)
-        bot.send_message(user_id, text)
 
-    elif data == "adm_stats_today":
-        bot.answer_callback_query(call.id, "زوار اليوم", show_alert=False)
-        today = get_today_str()
-        count = db["stats"]["visitors_by_date"].get(today, 0)
+        clear_subscription(target_id)
         bot.send_message(
-            user_id,
-            f"📅 <b>عدد الزوار اليوم ({today}):</b> {count}"
+            chat_id,
+            f"⛔ تم إلغاء اشتراك المستخدم ID: <code>{target_id}</code>."
         )
+        try:
+            bot.send_message(
+                target_id,
+                "⛔ تم إلغاء اشتراكك من قبل الإدارة."
+            )
+        except Exception:
+            pass
+
+        session["step"] = None
+        user_sessions[chat_id] = session
+        return
+
+    # إن لم يكن في خطوة إدارية خاصة، نترك المعالجة للهاندلر الأساسي
+    handle_text(message)
 
 
-# ================= تشغيل البوت مع معالجة أخطاء polling =================
+# ================ تشغيل البوت مع معالجة أخطاء polling =================
 if __name__ == "__main__":
     logger.info("🔥 Bot is running…")
 
     while True:
         try:
+            # skip_pending=True حتى لا يأخذ رسائل قديمة عند كل إعادة تشغيل
             bot.infinity_polling(skip_pending=True, timeout=60)
         except Exception as e:
             logger.error("Polling error from Telegram: %s", e)
-            # ملاحظة: لو ظهر خطأ 409 فهذا يعني أن هناك نسخة أخرى من البوت تعمل بنفس التوكن
-            # يجب إيقاف أي Instance أخرى للبوت (في Koyeb أو أي مكان آخر).
+            # لو ظهر خطأ 409 فهذا يعني أن هناك نسخة أخرى من البوت تعمل بنفس التوكن
             time.sleep(5)
