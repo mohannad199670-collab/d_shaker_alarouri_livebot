@@ -1315,23 +1315,30 @@ def start_cutting(chat_id: int):
 
 # ================ معالجة إدخال ID في لوحة التحكم ================
 
-@bot.message_handler(func=lambda m: m.text is not None and m.chat.id == ADMIN_ID)
+@bot.message_handler(func=lambda m: m.text is not None)
 def handle_admin_text_extra(message):
-    """معالجة نصوص إضافية للأدمن (ID للتفعيل/الإلغاء)"""
     chat_id = message.chat.id
+    text = message.text.strip()
+
+    # تحديد جلسة المستخدم
     session = user_sessions.get(chat_id) or {}
     step = session.get("step")
 
+    # لو المرسل ليس الأدمن → نعيده للهاندلر الأساسي
+    if not is_admin(chat_id):
+        return handle_text(message)
+
+    # ========== تفعيل الاشتراك (إدخال ID) ==========
     if step == "admin_wait_user_id":
-        # تفعيل اشتراك لباقته المختارة
         plan_key = session.get("admin_chosen_plan")
-        plan = PLANS.get(plan_key) if plan_key else None
+        plan = PLANS.get(plan_key)
+
         if not plan:
-            bot.reply_to(message, "⚠️ لم يتم اختيار باقة بعد، اختر الباقة أولاً من لوحة التحكم.")
+            bot.reply_to(message, "⚠️ اختر الباقة أولاً من لوحة التحكم.")
             return
 
         try:
-            target_id = int(message.text.strip())
+            target_id = int(text)
         except ValueError:
             bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
             return
@@ -1343,6 +1350,8 @@ def handle_admin_text_extra(message):
             chat_id,
             f"✅ تم تفعيل باقة <b>{plan['name']}</b> للمستخدم ID: <code>{target_id}</code>."
         )
+
+        # رسالة للمستخدم
         try:
             bot.send_message(
                 target_id,
@@ -1356,18 +1365,22 @@ def handle_admin_text_extra(message):
         user_sessions[chat_id] = session
         return
 
+    # ========== إلغاء الاشتراك (إدخال ID) ==========
     if step == "admin_cancel_wait_id":
         try:
-            target_id = int(message.text.strip())
+            target_id = int(text)
         except ValueError:
             bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
             return
 
         clear_subscription(target_id)
+
         bot.send_message(
             chat_id,
             f"⛔ تم إلغاء اشتراك المستخدم ID: <code>{target_id}</code>."
         )
+
+        # رسالة للمستخدم
         try:
             bot.send_message(
                 target_id,
@@ -1380,19 +1393,5 @@ def handle_admin_text_extra(message):
         user_sessions[chat_id] = session
         return
 
-    # إن لم يكن في خطوة إدارية خاصة، نترك المعالجة للهاندلر الأساسي
-    handle_text(message)
-
-
-# ================ تشغيل البوت مع معالجة أخطاء polling =================
-if __name__ == "__main__":
-    logger.info("🔥 Bot is running…")
-
-    while True:
-        try:
-            # skip_pending=True حتى لا يأخذ رسائل قديمة عند كل إعادة تشغيل
-            bot.infinity_polling(skip_pending=True, timeout=60)
-        except Exception as e:
-            logger.error("Polling error from Telegram: %s", e)
-            # لو ظهر خطأ 409 فهذا يعني أن هناك نسخة أخرى من البوت تعمل بنفس التوكن
-            time.sleep(5)
+    # لو لم يكن الأدمن في حالة إدخال ID → نعود للهاندلر الأساسي
+    return handle_text(message)
