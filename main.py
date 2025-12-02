@@ -1125,19 +1125,18 @@ def show_admin_panel(chat_id: int):
     def show_admin_panel(chat_id: int):
     """عرض لوحة التحكم للأدمن"""
 
-    # لوحة التحكم الأساسية (Reply Keyboard)
-    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    markup.add(
-        KeyboardButton("✂️ قص مقطع يوتيوب"),
-        KeyboardButton("📦 الاشتراكات"),
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(
+        KeyboardButton("☑️ تفعيل اشتراك"),
+        KeyboardButton("⛔ إلغاء اشتراك")
     )
-    markup.add(KeyboardButton("⚙️ الإعدادات"))
-    markup.add(KeyboardButton("🛠 لوحة التحكم"))
+    markup.row(
+        KeyboardButton("📊 الإحصائيات")
+    )
 
     bot.send_message(
         chat_id,
-        "🛠 <b>لوحة التحكم الإدارية</b>\n"
-        "اختر الإجراء المطلوب:",
+        "🛠️ لوحة التحكم الإدارية\nاختر الإجراء المطلوب من الأزرار التالية:",
         reply_markup=markup
     )
 
