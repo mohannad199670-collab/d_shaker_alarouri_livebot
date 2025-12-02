@@ -325,13 +325,24 @@ def reset_session(chat_id: int):
 
 def build_main_keyboard(chat_id: int):
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    kb.add(
+
+    # الصف الأول: قص + الاشتراكات للجميع
+    kb.row(
         KeyboardButton("✂️ قص مقطع يوتيوب"),
         KeyboardButton("📦 الاشتراكات"),
     )
-    kb.add(KeyboardButton("⚙️ الإعدادات"))
+
+    # الصف الثاني:
     if is_admin(chat_id):
-        kb.add(KeyboardButton("🛠 لوحة التحكم"))
+        # للأدمن: الإعدادات + لوحة التحكم معاً
+        kb.row(
+            KeyboardButton("⚙️ الإعدادات"),
+            KeyboardButton("🛠 لوحة التحكم"),
+        )
+    else:
+        # للمستخدم العادي: الإعدادات فقط
+        kb.row(KeyboardButton("⚙️ الإعدادات"))
+
     return kb
 
 
@@ -919,7 +930,7 @@ def ask_video_or_audio(chat_id: int):
     )
 
 
-# ========== كولباكات الاشتراكات والجودات وأنواع الملفات وطلبات الدفع ==========
+# ========== كولباكات الاشتراكات والجودات وأنواع الملفات وطلبات الدفع ولوحة التحكم ==========
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
@@ -1001,14 +1012,14 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "الباقة غير معروفة.", show_alert=True)
             return
 
-        chat_id = call.from_user.id
-        session = user_sessions.setdefault(chat_id, {})
+        chat_id_user = call.from_user.id
+        session = user_sessions.setdefault(chat_id_user, {})
         session["pending_plan"] = plan_key
         session["step"] = "await_payment_proof"
 
         bot.answer_callback_query(call.id, f"تم اختيار الباقة: {plan['name']}")
         bot.send_message(
-            chat_id,
+            chat_id_user,
             "📸 الآن أرسل لقطة شاشة لإشعار الدفع ليتم مراجعة طلبك وتفعيل الاشتراك."
         )
         return
@@ -1102,18 +1113,52 @@ def handle_callbacks(call):
         start_cutting(chat_id)
         return
 
-    bot.answer_callback_query(call.id)  # افتراضي
+    # سادساً: كولباكات لوحة التحكم الإدارية (تفعيل، إلغاء، إحصائيات)
+    if data in ["admin_activate", "admin_cancel", "admin_stats"]:
+        if not is_admin(chat_id):
+            bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
+            return
+
+        admin_session = user_sessions.setdefault(chat_id, {})
+
+        if data == "admin_activate":
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                chat_id,
+                "✅ اختر أولاً الباقة التي تريد تفعيلها للمستخدم:",
+                reply_markup=build_plans_keyboard(for_admin_manual=True),
+            )
+            return
+
+        if data == "admin_cancel":
+            bot.answer_callback_query(call.id)
+            admin_session["step"] = "admin_cancel_wait_id"
+            bot.send_message(
+                chat_id,
+                "⛔ أرسل الآن <b>ID</b> المستخدم الذي تريد إلغاء اشتراكه."
+            )
+            return
+
+        if data == "admin_stats":
+            bot.answer_callback_query(call.id)
+            bot.send_message(chat_id, get_stats_text())
+            return
+
+    # افتراضي
+    bot.answer_callback_query(call.id)
 
 
 def show_admin_panel(chat_id: int):
     """عرض لوحة التحكم للأدمن"""
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    markup.add(
+    markup.row(
         KeyboardButton("✂️ قص مقطع يوتيوب"),
         KeyboardButton("📦 الاشتراكات"),
     )
-    markup.add(KeyboardButton("⚙️ الإعدادات"))
-    markup.add(KeyboardButton("🛠 لوحة التحكم"))
+    markup.row(
+        KeyboardButton("⚙️ الإعدادات"),
+        KeyboardButton("🛠 لوحة التحكم"),
+    )
 
     bot.send_message(
         chat_id,
@@ -1132,40 +1177,6 @@ def show_admin_panel(chat_id: int):
         InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
     )
     bot.send_message(chat_id, "اختر من لوحة التحكم:", reply_markup=inline)
-
-
-@bot.callback_query_handler(func=lambda c: c.data in ["admin_activate", "admin_cancel", "admin_stats"])
-def handle_admin_panel_callbacks(call):
-    chat_id = call.message.chat.id
-    if not is_admin(chat_id):
-        bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
-        return
-
-    data = call.data
-    admin_session = user_sessions.setdefault(chat_id, {})
-
-    if data == "admin_activate":
-        bot.answer_callback_query(call.id)
-        bot.send_message(
-            chat_id,
-            "✅ اختر أولاً الباقة التي تريد تفعيلها للمستخدم:",
-            reply_markup=build_plans_keyboard(for_admin_manual=True),
-        )
-        return
-
-    if data == "admin_cancel":
-        bot.answer_callback_query(call.id)
-        admin_session["step"] = "admin_cancel_wait_id"
-        bot.send_message(
-            chat_id,
-            "⛔ أرسل الآن <b>ID</b> المستخدم الذي تريد إلغاء اشتراكه."
-        )
-        return
-
-    if data == "admin_stats":
-        bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, get_stats_text())
-        return
 
 
 def start_cutting(chat_id: int):
