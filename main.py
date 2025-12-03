@@ -15,8 +15,8 @@ from telebot.types import (
 )
 from telebot.apihelper import ApiTelegramException
 
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+import requests
+from requests.exceptions import RequestException
 
 # ================= إعداد اللوج =================
 logging.basicConfig(
@@ -33,70 +33,24 @@ if not BOT_TOKEN:
 # ADMIN_ID من متغير البيئة إن وُجد، وإلا يستخدم ID الافتراضي (ID الخاص بك)
 ADMIN_ENV = os.getenv("ADMIN_ID", "").strip()
 try:
-    ADMIN_ID = int(ADMIN_ENV) if ADMIN_ENV else 604494923  # ضع ID الخاص بك هنا كافتراضي
+    ADMIN_ID = int(ADMIN_ENV) if ADMIN_ENV else 604494923
 except ValueError:
     ADMIN_ID = 604494923
     logger.warning("⚠️ قيمة ADMIN_ID في البيئة غير صالحة، سيتم استخدام 604494923 كأدمن افتراضي")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ================ إعداد الكوكيز الخاصة بيوتيوب ================
-# متغير البيئة الذي تضع فيه هيدر الكوكيز الكامل:
-# مثال: SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...
+# ================ إعداد الكوكيز / API الخارجي ليوتيوب ================
+# (لم نعد نستخدم yt_dlp + كوكيز مباشرة، بل API خارجي)
+
+# متغيرات البيئة الخاصة بالـ API الخارجي
+# يجب أن تؤمّن أنت API حقيقي وترتبه ليُرجع JSON بالشكل الموضح في الدالة call_youtube_api
+YT_API_BASE = os.getenv("YT_API_BASE", "").strip()  # مثال: https://example.com/youtube
+YT_API_KEY = os.getenv("YT_API_KEY", "").strip()    # مفتاح الـ API من الموقع الخارجي
+
+# فقط للـ backward compatibility إن احتجته لاحقاً (حالياً غير مستخدم)
 YT_COOKIES_HEADER = os.getenv("YT_COOKIES_HEADER", os.getenv("YT_COOKIES", "")).strip()
-
-# إلغاء استخدام ملف cookies.txt نهائياً
 COOKIES_PATH = None
-
-# ================ وضع المتصفح الوهمي (Fake Browser Mode) ليوتيوب ================
-FAKE_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-def build_youtube_headers() -> dict:
-    """
-    إنشاء ترويسات (Headers) تشبه متصفح كروم حقيقي
-    حتى يتعامل يوتيوب مع الطلب كأنه متصفح وليس سكربت.
-    """
-    headers = {
-        "User-Agent": FAKE_BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Referer": "https://www.youtube.com/",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    if YT_COOKIES_HEADER:
-        headers["Cookie"] = YT_COOKIES_HEADER
-    return headers
-
-
-def build_yt_dlp_opts(base: dict | None = None, *, skip_download: bool = False) -> dict:
-    """
-    إعداد خيارات yt-dlp مع تفعيل وضع المتصفح الوهمي + إعادة المحاولات.
-    """
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "geo_bypass": True,
-        "noplaylist": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "ignoreerrors": True,
-        "nocheckcertificate": True,
-        "http_headers": build_youtube_headers(),
-    }
-    if skip_download:
-        opts["skip_download"] = True
-    if base:
-        opts.update(base)
-    return opts
-
 
 # ================ إعدادات الحجم =================
 MAX_TELEGRAM_MB = 48  # الحد المستهدف لكل جزء (تقريباً 48 ميغا)
@@ -359,7 +313,6 @@ def get_stats_text() -> str:
 #       "quality_height": 360,
 #       "mode": "video" / "audio",
 #       "pending_plan": "p1" / "p3" / ...,
-#       "admin_chosen_plan": "p1" / ... (للأدمن),
 #   }
 # }
 user_sessions = {}
@@ -411,6 +364,53 @@ def build_plans_keyboard(for_admin_manual: bool = False):
     return markup
 
 
+# ================ دوال API الخارجي ليوتيوب ================
+
+def call_youtube_api(video_url: str) -> dict:
+    """
+    يستدعي API خارجي ليوتيوب.
+
+    يجب أن يكون الـ API جاهزاً لديك ويرجع JSON تقريباً بهذا الشكل (مثال مقترح):
+
+    {
+      "success": true,
+      "title": "Video title",
+      "duration": 600,
+      "qualities": [
+        {"height": 144, "url": "https://..."},
+        {"height": 360, "url": "https://..."},
+        {"height": 720, "url": "https://..."}
+      ]
+    }
+
+    عدل endpoint أو structure حسب موقع الـ API الذي ستستخدمه.
+    """
+    if not YT_API_BASE or not YT_API_KEY:
+        raise RuntimeError("YT_API_BASE و YT_API_KEY غير مضبوطين في متغيرات البيئة")
+
+    api_url = f"{YT_API_BASE.rstrip('/')}/info"
+    try:
+        resp = requests.get(
+            api_url,
+            params={"url": video_url, "key": YT_API_KEY},
+            timeout=40,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except RequestException as e:
+        logger.error("Error calling external YT API: %s", e)
+        raise RuntimeError("خطأ في الاتصال بـ API الخارجي") from e
+    except ValueError as e:
+        logger.error("Invalid JSON from external YT API: %s", e)
+        raise RuntimeError("استجابة JSON غير صالحة من API الخارجي") from e
+
+    if not isinstance(data, dict) or not data.get("success"):
+        logger.error("API returned error or invalid format: %s", data)
+        raise RuntimeError("API الخارجي رجع نتيجة غير ناجحة أو تنسيق غير متوقع")
+
+    return data
+
+
 # ================ دوال قص الفيديو وتحميله ================
 
 def extract_url(text: str) -> str:
@@ -447,75 +447,75 @@ def parse_time_to_seconds(time_str: str) -> int:
 
 def get_available_qualities(video_url: str):
     """
-    إرجاع قائمة الجودات المتاحة مع صوت (فيديو+أوديو) مثل:
-    [144, 240, 360, 480, 720, 1080]
-    إذا حصل خطأ نرمي استثناء ونتعامل معه خارج الدالة.
+    إرجاع قائمة الجودات المتاحة (ارتفاع الفيديو) من الـ API الخارجي.
+    نتوقع أن الـ API يرجع قائمة qualities فيها height.
     """
-    ydl_opts = build_yt_dlp_opts(skip_download=True)
+    data = call_youtube_api(video_url)
+    qualities = data.get("qualities") or []
 
     target_heights = {144, 240, 360, 480, 720, 1080}
     available = set()
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        formats = info.get("formats", [])
-
-    for f in formats:
-        height = f.get("height")
-        if not height:
-            continue
-
-        if height not in target_heights:
-            continue
-
-        # نتأكد أن فيه صوت
-        acodec = f.get("acodec")
-        audio_ext = f.get("audio_ext")
-        has_audio = (acodec and acodec != "none") or (audio_ext and audio_ext != "none")
-
-        if has_audio:
-            available.add(height)
+    for q in qualities:
+        h = q.get("height")
+        if isinstance(h, int) and h in target_heights:
+            available.add(h)
 
     return sorted(list(available))
 
 
-def build_format_string_for_height(height: int | None) -> str:
-    """
-    صيغة الفورمات لـ yt-dlp بحيث يختار فيديو+صوت حسب الارتفاع المطلوب،
-    مع fallback في حال عدم توفر نفس الارتفاع بالضبط.
-    """
-    if height is None:
-        # أفضل شيء متاح
-        return "bv*+ba/best"
-
-    # نحاول mp4 + m4a أولاً ثم أي شيء أقل من أو يساوي هذه الجودة
-    return (
-        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]/best"
-    )
-
-
 def download_video(video_url: str, quality_height: int | None, output_name: str = "source") -> str:
     """
-    تحميل الفيديو من يوتيوب بالجودة المطلوبة (مع صوت) وإرجاع اسم الملف.
-    دائماً يخرج بصيغة mp4 (بفضل merge_output_format).
+    تحميل الفيديو من API خارجي بالجودة المطلوبة وإرجاع اسم الملف المحلي (mp4).
+    نعتمد على اختيار الـ url المناسب من البيانات التي يرجعها الـ API.
     """
-    fmt = build_format_string_for_height(quality_height)
+    data = call_youtube_api(video_url)
+    qualities = data.get("qualities") or []
+    if not qualities:
+        raise RuntimeError("لم يتم العثور على أي جودات في API الخارجي")
 
-    base_opts = {
-        "format": fmt,
-        "outtmpl": f"{output_name}.%(ext)s",
-        "merge_output_format": "mp4",
-    }
+    # فلترة القيم الصالحة
+    valid_qualities = [q for q in qualities if isinstance(q.get("height"), int) and q.get("url")]
+    if not valid_qualities:
+        raise RuntimeError("قائمة الجودات من API لا تحتوي على قيم صالحة")
 
-    ydl_opts = build_yt_dlp_opts(base_opts, skip_download=False)
+    chosen = None
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        filename = ydl.prepare_filename(info)
+    if quality_height is None:
+        # اختر أعلى جودة متاحة
+        chosen = max(valid_qualities, key=lambda q: q["height"])
+    else:
+        # نحاول اختيار أعلى جودة أقل أو تساوي المطلوب، وإن لم يوجد نختار أقرب جودة
+        # أقل من المطلوب، ثم إن لم يوجد نأخذ أي جودة (أعلى واحدة).
+        lower_or_equal = [q for q in valid_qualities if q["height"] <= quality_height]
+        if lower_or_equal:
+            chosen = max(lower_or_equal, key=lambda q: q["height"])
+        else:
+            # لا يوجد ما هو أقل من المطلوب، اختر أقل فرق مطلق
+            chosen = min(valid_qualities, key=lambda q: abs(q["height"] - quality_height))
 
-    return filename  # مثل "source.mp4"
+    download_url = chosen.get("url")
+    if not download_url:
+        raise RuntimeError("لم أستطع الحصول على رابط التحميل من API الخارجي")
+
+    local_filename = f"{output_name}.mp4"
+    logger.info("Downloading from external API url=%s -> %s", download_url, local_filename)
+
+    try:
+        with requests.get(download_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(local_filename, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+    except RequestException as e:
+        logger.error("Error downloading video file from external API: %s", e)
+        raise RuntimeError("فشل تحميل ملف الفيديو من رابط الـ API") from e
+
+    if not os.path.exists(local_filename) or os.path.getsize(local_filename) == 0:
+        raise RuntimeError("تم تحميل ملف فارغ أو لم يتم حفظ الملف بشكل صحيح")
+
+    return local_filename  # مثل "source.mp4"
 
 
 def cut_video_range(input_file: str, start_seconds: int, duration_seconds: int, output_file: str = "cut_full.mp4") -> str:
@@ -747,71 +747,6 @@ def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
 
-    # ================= منطق خاص للأدمن لإدخال ID للتفعيل/الإلغاء =================
-    if is_admin(chat_id):
-        session = user_sessions.get(chat_id) or {}
-        step = session.get("step")
-
-        if step == "admin_wait_user_id":
-            # تفعيل اشتراك لباقته المختارة
-            plan_key = session.get("admin_chosen_plan")
-            plan = PLANS.get(plan_key) if plan_key else None
-            if not plan:
-                bot.reply_to(message, "⚠️ لم يتم اختيار باقة بعد، اختر الباقة أولاً من لوحة التحكم.")
-                return
-
-            try:
-                target_id = int(text)
-            except ValueError:
-                bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
-                return
-
-            set_subscription(target_id, plan_key)
-            status = subscription_status_text(target_id)
-
-            bot.send_message(
-                chat_id,
-                f"✅ تم تفعيل باقة <b>{plan['name']}</b> للمستخدم ID: <code>{target_id}</code>."
-            )
-            try:
-                bot.send_message(
-                    target_id,
-                    "✅ تم تفعيل اشتراكك من قبل الإدارة.\n\n" + status
-                )
-            except Exception:
-                pass
-
-            session["step"] = None
-            session["admin_chosen_plan"] = None
-            user_sessions[chat_id] = session
-            return
-
-        if step == "admin_cancel_wait_id":
-            try:
-                target_id = int(text)
-            except ValueError:
-                bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
-                return
-
-            clear_subscription(target_id)
-            bot.send_message(
-                chat_id,
-                f"⛔ تم إلغاء اشتراك المستخدم ID: <code>{target_id}</code>."
-            )
-            try:
-                bot.send_message(
-                    target_id,
-                    "⛔ تم إلغاء اشتراكك من قبل الإدارة."
-                )
-            except Exception:
-                pass
-
-            session["step"] = None
-            user_sessions[chat_id] = session
-            return
-
-    # ================= بقية منطق الرسائل العادية =================
-
     # الأوامر النصية الخاصة
     if text.startswith("/"):
         return
@@ -835,9 +770,14 @@ def handle_text(message):
     if text == "📦 الاشتراكات":
         user_id = message.from_user.id
         status = subscription_status_text(user_id)
+        payeer_info = (
+            "\n\n💳 <b>طريقة الدفع المتاحة حالياً:</b>\n"
+            "الدفع عبر <b>Payeer</b> فقط:\n"
+            "<code>P1058635648</code>\n"
+        )
         bot.send_message(
             chat_id,
-            f"{status}\n\n"
+            f"{status}\n{payeer_info}\n"
             "🧾 <b>اختر الباقة التي ترغب بها:</b>",
             reply_markup=build_plans_keyboard(for_admin_manual=False),
         )
@@ -950,19 +890,19 @@ def handle_text(message):
         session["duration"] = duration
 
         # الآن فحص الجودات
-        bot.reply_to(message, "⏳ يتم فحص الجودات المتاحة للفيديو…")
+        bot.reply_to(message, "⏳ يتم فحص الجودات المتاحة للفيديو عبر API الخارجي…")
 
         video_url = session["url"]
         try:
             heights = get_available_qualities(video_url)
         except Exception as e:
-            logger.error("Error getting qualities from YouTube", exc_info=e)
+            logger.error("Error getting qualities from external YT API", exc_info=e)
             # لو فشل الفحص، نستخدم 360p افتراضياً
             session["quality_height"] = 360
             session["step"] = "choose_mode"
             bot.send_message(
                 chat_id,
-                "❌ حدث خطأ أثناء فحص الجودات من يوتيوب.\n"
+                "❌ حدث خطأ أثناء فحص الجودات من API الخارجي.\n"
                 "سيتم استخدام جودة <b>360p</b> افتراضياً."
             )
             ask_video_or_audio(chat_id)
@@ -973,7 +913,7 @@ def handle_text(message):
             session["step"] = "choose_mode"
             bot.send_message(
                 chat_id,
-                "⚠️ لم أجد جودات قياسية (144p–1080p) مع صوت.\n"
+                "⚠️ لم أجد جودات قياسية (144p–1080p) من API الخارجي.\n"
                 "سيتم استخدام جودة <b>360p</b> افتراضياً."
             )
             ask_video_or_audio(chat_id)
@@ -1117,9 +1057,21 @@ def handle_callbacks(call):
         session["step"] = "await_payment_proof"
 
         bot.answer_callback_query(call.id, f"تم اختيار الباقة: {plan['name']}")
+
+        payment_text = (
+            "💳 <b>معلومات الدفع</b>\n\n"
+            f"📦 الباقة المختارة: <b>{plan['name']}</b>\n"
+            f"⏳ مدة الباقة: <b>{plan['days']}</b> يوم\n\n"
+            "1️⃣ قم بتحويل المبلغ المطلوب إلى حساب <b>Payeer</b> التالي:\n"
+            "<code>P1058635648</code>\n\n"
+            "2️⃣ بعد إتمام التحويل، أرسل هنا <b>لقطة شاشة لإشعار الدفع</b> "
+            "ليتم مراجعة الطلب وتفعيل اشتراكك.\n\n"
+            "📡 بعد التأكيد من الإدارة ستصلك رسالة بتفعيل الباقة."
+        )
+
         bot.send_message(
             chat_id_user,
-            "📸 الآن أرسل لقطة شاشة لإشعار الدفع ليتم مراجعة طلبك وتفعيل الاشتراك."
+            payment_text
         )
         return
 
@@ -1297,7 +1249,7 @@ def start_cutting(chat_id: int):
 
     bot.send_message(
         chat_id,
-        "🔧 جاري تحميل الفيديو وقص المقطع…\n"
+        "🔧 جاري تحميل الفيديو وقص المقطع عبر API الخارجي…\n"
         "قد يستغرق ذلك بعض الوقت حسب طول المقطع والجودة."
     )
 
@@ -1307,7 +1259,7 @@ def start_cutting(chat_id: int):
     audio_file = None
 
     try:
-        # تحميل الفيديو مع صوت
+        # تحميل الفيديو من API خارجي
         input_file = download_video(url, quality_height, output_name="source")
         logger.info("Downloaded video file: %s", input_file)
 
@@ -1392,12 +1344,12 @@ def start_cutting(chat_id: int):
         )
         reset_session(chat_id)
 
-    except DownloadError as e:
-        logger.error("DownloadError from YouTube", exc_info=e)
+    except RuntimeError as e:
+        logger.error("Error in external YT API / download: %s", e)
         bot.send_message(
             chat_id,
-            "❌ حدث خطأ أثناء تحميل الفيديو من يوتيوب.\n"
-            "جرّب لاحقاً أو استخدم رابطاً آخر. إذا تكررت المشكلة بشكل دائم يمكن حينها استخدام كوكيز YT_COOKIES_HEADER."
+            "❌ حدث خطأ أثناء تحميل أو تجهيز الفيديو عبر API الخارجي.\n"
+            "تأكد من أن الرابط صحيح، وأن إعدادات YT_API_BASE و YT_API_KEY صحيحة في متغيرات البيئة."
         )
     except Exception as e:
         logger.error("Unexpected error in start_cutting", exc_info=e)
@@ -1410,6 +1362,77 @@ def start_cutting(chat_id: int):
             clean_files(input_file, cut_file, audio_file, *parts)
         except Exception:
             pass
+
+
+# ================ معالجة إدخال ID في لوحة التحكم ================
+
+@bot.message_handler(func=lambda m: m.text is not None and m.chat.id == ADMIN_ID)
+def handle_admin_text_extra(message):
+    """معالجة نصوص إضافية للأدمن (ID للتفعيل/الإلغاء)"""
+    chat_id = message.chat.id
+    session = user_sessions.get(chat_id) or {}
+    step = session.get("step")
+
+    if step == "admin_wait_user_id":
+        # تفعيل اشتراك لباقته المختارة
+        plan_key = session.get("admin_chosen_plan")
+        plan = PLANS.get(plan_key) if plan_key else None
+        if not plan:
+            bot.reply_to(message, "⚠️ لم يتم اختيار باقة بعد، اختر الباقة أولاً من لوحة التحكم.")
+            return
+
+        try:
+            target_id = int(message.text.strip())
+        except ValueError:
+            bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
+            return
+
+        set_subscription(target_id, plan_key)
+        status = subscription_status_text(target_id)
+
+        bot.send_message(
+            chat_id,
+            f"✅ تم تفعيل باقة <b>{plan['name']}</b> للمستخدم ID: <code>{target_id}</code>."
+        )
+        try:
+            bot.send_message(
+                target_id,
+                "✅ تم تفعيل اشتراكك من قبل الإدارة.\n\n" + status
+            )
+        except Exception:
+            pass
+
+        session["step"] = None
+        session["admin_chosen_plan"] = None
+        user_sessions[chat_id] = session
+        return
+
+    if step == "admin_cancel_wait_id":
+        try:
+            target_id = int(message.text.strip())
+        except ValueError:
+            bot.reply_to(message, "⚠️ أرسل ID رقمي صحيح.")
+            return
+
+        clear_subscription(target_id)
+        bot.send_message(
+            chat_id,
+            f"⛔ تم إلغاء اشتراك المستخدم ID: <code>{target_id}</code>."
+        )
+        try:
+            bot.send_message(
+                target_id,
+                "⛔ تم إلغاء اشتراكك من قبل الإدارة."
+            )
+        except Exception:
+            pass
+
+        session["step"] = None
+        user_sessions[chat_id] = session
+        return
+
+    # إن لم يكن في خطوة إدارية خاصة، نترك المعالجة للهاندلر الأساسي
+    handle_text(message)
 
 
 # ================ تشغيل البوت مع معالجة أخطاء polling =================
