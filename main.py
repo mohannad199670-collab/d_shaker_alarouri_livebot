@@ -33,7 +33,7 @@ if not BOT_TOKEN:
 # ADMIN_ID من متغير البيئة إن وُجد، وإلا يستخدم ID الافتراضي (ID الخاص بك)
 ADMIN_ENV = os.getenv("ADMIN_ID", "").strip()
 try:
-    ADMIN_ID = int(ADMIN_ENV) if ADMIN_ENV else 604494923
+    ADMIN_ID = int(ADMIN_ENV) if ADMIN_ENV else 604494923  # ضع ID الخاص بك هنا كافتراضي
 except ValueError:
     ADMIN_ID = 604494923
     logger.warning("⚠️ قيمة ADMIN_ID في البيئة غير صالحة، سيتم استخدام 604494923 كأدمن افتراضي")
@@ -47,6 +47,56 @@ YT_COOKIES_HEADER = os.getenv("YT_COOKIES_HEADER", os.getenv("YT_COOKIES", "")).
 
 # إلغاء استخدام ملف cookies.txt نهائياً
 COOKIES_PATH = None
+
+# ================ وضع المتصفح الوهمي (Fake Browser Mode) ليوتيوب ================
+FAKE_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def build_youtube_headers() -> dict:
+    """
+    إنشاء ترويسات (Headers) تشبه متصفح كروم حقيقي
+    حتى يتعامل يوتيوب مع الطلب كأنه متصفح وليس سكربت.
+    """
+    headers = {
+        "User-Agent": FAKE_BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Referer": "https://www.youtube.com/",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if YT_COOKIES_HEADER:
+        headers["Cookie"] = YT_COOKIES_HEADER
+    return headers
+
+
+def build_yt_dlp_opts(base: dict | None = None, *, skip_download: bool = False) -> dict:
+    """
+    إعداد خيارات yt-dlp مع تفعيل وضع المتصفح الوهمي + إعادة المحاولات.
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "geo_bypass": True,
+        "noplaylist": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "ignoreerrors": True,
+        "nocheckcertificate": True,
+        "http_headers": build_youtube_headers(),
+    }
+    if skip_download:
+        opts["skip_download"] = True
+    if base:
+        opts.update(base)
+    return opts
+
 
 # ================ إعدادات الحجم =================
 MAX_TELEGRAM_MB = 48  # الحد المستهدف لكل جزء (تقريباً 48 ميغا)
@@ -309,6 +359,7 @@ def get_stats_text() -> str:
 #       "quality_height": 360,
 #       "mode": "video" / "audio",
 #       "pending_plan": "p1" / "p3" / ...,
+#       "admin_chosen_plan": "p1" / ... (للأدمن),
 #   }
 # }
 user_sessions = {}
@@ -400,18 +451,7 @@ def get_available_qualities(video_url: str):
     [144, 240, 360, 480, 720, 1080]
     إذا حصل خطأ نرمي استثناء ونتعامل معه خارج الدالة.
     """
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "geo_bypass": True,
-    }
-
-    # استخدام الكوكيز من الهيدر إذا موجودة
-    if YT_COOKIES_HEADER:
-        ydl_opts["http_headers"] = {
-            "Cookie": YT_COOKIES_HEADER
-        }
+    ydl_opts = build_yt_dlp_opts(skip_download=True)
 
     target_heights = {144, 240, 360, 480, 720, 1080}
     available = set()
@@ -463,19 +503,13 @@ def download_video(video_url: str, quality_height: int | None, output_name: str 
     """
     fmt = build_format_string_for_height(quality_height)
 
-    ydl_opts = {
+    base_opts = {
         "format": fmt,
         "outtmpl": f"{output_name}.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "geo_bypass": True,
         "merge_output_format": "mp4",
     }
 
-    if YT_COOKIES_HEADER:
-        ydl_opts["http_headers"] = {
-            "Cookie": YT_COOKIES_HEADER
-        }
+    ydl_opts = build_yt_dlp_opts(base_opts, skip_download=False)
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
@@ -713,9 +747,9 @@ def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
 
-    # ================= أولوية: خطوات الأدمن (تفعيل / إلغاء بالـ ID) =================
+    # ================= منطق خاص للأدمن لإدخال ID للتفعيل/الإلغاء =================
     if is_admin(chat_id):
-        session = user_sessions.get(chat_id, {})
+        session = user_sessions.get(chat_id) or {}
         step = session.get("step")
 
         if step == "admin_wait_user_id":
@@ -776,9 +810,9 @@ def handle_text(message):
             user_sessions[chat_id] = session
             return
 
-    # ================= أوامر نصية خاصة (ليست خطوات إدارية) =================
+    # ================= بقية منطق الرسائل العادية =================
 
-    # الأوامر النصية التي تبدأ بـ /
+    # الأوامر النصية الخاصة
     if text.startswith("/"):
         return
 
@@ -990,7 +1024,7 @@ def ask_video_or_audio(chat_id: int):
     )
     bot.send_message(
         chat_id,
-        "🎛️ <b>اختر نوع الملف الذي تريده:</b>",
+        "🎚️ <b>اختر نوع الملف الذي تريده:</b>",
         reply_markup=markup
     )
 
@@ -1363,7 +1397,7 @@ def start_cutting(chat_id: int):
         bot.send_message(
             chat_id,
             "❌ حدث خطأ أثناء تحميل الفيديو من يوتيوب.\n"
-            "تأكد أن رابط الفيديو يعمل، وأن متغير الكوكيز <b>YT_COOKIES_HEADER</b> (أو YT_COOKIES) صحيح ومحدّث."
+            "جرّب لاحقاً أو استخدم رابطاً آخر. إذا تكررت المشكلة بشكل دائم يمكن حينها استخدام كوكيز YT_COOKIES_HEADER."
         )
     except Exception as e:
         logger.error("Unexpected error in start_cutting", exc_info=e)
