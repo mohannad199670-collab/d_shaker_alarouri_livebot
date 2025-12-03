@@ -1,2 +1,3 @@
-pytelegrambotapi
+fastapi
+uvicorn[standard]
 yt-dlp
