@@ -1,4 +1,3 @@
-'''
 import os
 import re
 import math
@@ -31,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ================ إعداد التوكن و ID الأدمن ================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # يمكنك حذفه إذا تضع التوكن من المتغيرات فقط
 
 ADMIN_ENV = os.getenv("ADMIN_ID", "").strip()
 try:
@@ -42,8 +41,11 @@ except ValueError:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
+# ================ بيانات الدفع ================
+PAYEER_ACCOUNT = "P1058635648"  # حساب Payeer الخاص بك
+
 # ================ إعدادات الحجم =================
-MAX_TELEGRAM_MB = 48
+MAX_TELEGRAM_MB = 48  # الحد الأقصى المستهدف لكل جزء
 
 # ================ ملف قاعدة البيانات البسيطة =================
 DB_FILE = "database.json"
@@ -268,11 +270,16 @@ def get_stats_text() -> str:
     )
 
 # ================ إدارة جلسات المستخدم =================
+# لكل مستخدم نخزن:
+# step, url, start, end, duration, quality_height, mode,
+# pending_plan, admin_chosen_plan, ...
 user_sessions = {}
 
 def reset_session(chat_id: int):
     user_sessions[chat_id] = {
-        "step": "await_url"
+        "step": "await_url",
+        "pending_plan": None,
+        "admin_chosen_plan": None,
     }
 
 # ================ دوال مساعدة للواجهة ================
@@ -347,13 +354,15 @@ def get_available_qualities(video_url: str) -> list[int]:
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(video_url, download=False)
+            if not info_dict:
+                return []
             formats = info_dict.get('formats', [])
-            
+
             heights = set()
             for f in formats:
                 if f.get('height') and f.get('ext') == 'mp4':
                     heights.add(f['height'])
-            
+
             return sorted(list(heights), reverse=True)
 
     except DownloadError as e:
@@ -404,7 +413,7 @@ def split_video_to_parts(input_file: str, max_mb: int) -> list[str]:
         ]
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         parts.append(output_name)
-    
+
     return parts
 
 def clean_files(*files):
@@ -445,7 +454,7 @@ def handle_subscription_menu(message):
     bot.send_message(
         chat_id,
         f"<b>حالة اشتراكك:</b>\n{status}\n\n"
-        "اختر باقة لتجديد أو تفعيل اشتراكك:",
+        "🧾 اختر باقة لتجديد أو تفعيل اشتراكك:",
         reply_markup=build_plans_keyboard(),
     )
 
@@ -454,7 +463,7 @@ def handle_settings(message):
     chat_id = message.chat.id
     bot.send_message(
         chat_id,
-        "هنا يمكنك إدارة إعداداتك الشخصية (سيتم إضافة المزيد من الخيارات لاحقاً).",
+        "⚙️ هنا يمكنك إدارة إعداداتك الشخصية (سيتم إضافة المزيد من الخيارات لاحقاً).",
         reply_markup=build_settings_keyboard(chat_id),
     )
 
@@ -466,30 +475,113 @@ def handle_admin_panel(message):
         reply_markup=build_admin_keyboard(),
     )
 
+# ================ معالج الصور (إثبات الدفع) ================
+@bot.message_handler(content_types=['photo'])
+def handle_payment_photo(message):
+    chat_id = message.chat.id
+    session = user_sessions.get(chat_id)
+    if session and session.get("step") == "await_payment_proof" and session.get("pending_plan"):
+        plan_key = session["pending_plan"]
+        plan = PLANS.get(plan_key)
+        if not plan:
+            bot.reply_to(message, "⚠️ حدث خطأ في تحديد الباقة، أعد اختيار الباقة مرة أخرى.")
+            reset_session(chat_id)
+            return
+
+        user = message.from_user
+        user_id = user.id
+        first_name = user.first_name or ""
+        username = user.username or ""
+        username_display = f"@{username}" if username else "لا يوجد"
+        profile_link = f"https://t.me/{username}" if username else "لا يوجد رابط"
+
+        caption = (
+            "🧾 <b>طلب اشتراك جديد (دفع عبر Payeer)</b>\n\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"👤 الاسم: {first_name}\n"
+            f"🪪 اليوزر: {username_display}\n"
+            f"🔗 الرابط: {profile_link}\n\n"
+            f"📦 الباقة المطلوبة: <b>{plan['name']}</b>\n"
+            f"⏳ مدة الباقة: <b>{plan['days']}</b> يوم\n\n"
+            f"💳 Payeer: <code>{PAYEER_ACCOUNT}</code>"
+        )
+
+        markup = InlineKeyboardMarkup()
+        markup.row(
+            InlineKeyboardButton("✅ تفعيل الاشتراك", callback_data=f"payok|{user_id}|{plan_key}"),
+            InlineKeyboardButton("❌ رفض الطلب", callback_data=f"payno|{user_id}|{plan_key}"),
+        )
+
+        try:
+            file_id = message.photo[-1].file_id
+            bot.send_photo(
+                ADMIN_ID,
+                file_id,
+                caption=caption,
+                reply_markup=markup,
+            )
+        except Exception as e:
+            logger.error("Error forwarding payment proof to admin: %s", e)
+
+        bot.reply_to(
+            message,
+            "✅ تم استلام لقطة شاشة الدفع.\n"
+            "📡 سيتم مراجعة طلبك من قبل الإدارة، وستصلك رسالة عند تفعيل الباقة أو رفض الطلب."
+        )
+
+        reset_session(chat_id)
+    else:
+        bot.reply_to(
+            message,
+            "📷 تم استلام الصورة.\n"
+            "إن كنت قد دفعت، تأكد من اختيار الباقة أولاً من زر <b>📦 الاشتراكات</b>."
+        )
+
+# ================ كولباكات الباقات + لوحة التحكم + الدفع ================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("plan_"))
 def handle_plan_selection(call):
     chat_id = call.message.chat.id
-    plan_key = call.data.split("_")[1]
-    is_admin_manual = call.data.endswith("_admin")
+    parts = call.data.split("_")  # مثال: plan_p1_user أو plan_p3_admin
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id, "❌ بيانات غير صالحة.")
+        return
+
+    _, plan_key, target = parts
+    is_admin_manual = (target == "admin")
 
     if is_admin_manual:
+        # تفعيل يدوي من الأدمن
+        if not is_admin(chat_id):
+            bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
+            return
+
         session = user_sessions.setdefault(chat_id, {})
         session["admin_chosen_plan"] = plan_key
+        session["step"] = "admin_await_user_id_for_plan"
         bot.edit_message_text(
-            "👍 تم اختيار الباقة. الآن أرسل ID المستخدم الذي تريد تفعيلها له.",
+            f"👍 تم اختيار الباقة: <b>{PLANS[plan_key]['name']}</b>\n"
+            "الآن أرسل ID المستخدم الذي تريد تفعيلها له.",
             chat_id,
             call.message.message_id,
         )
         return
 
+    # اختيار الباقة للمستخدم العادي
     plan = PLANS.get(plan_key)
     if not plan:
         bot.answer_callback_query(call.id, "❌ باقة غير صالحة.")
         return
 
+    user_chat_id = call.from_user.id
+    session = user_sessions.setdefault(user_chat_id, {})
+    session["pending_plan"] = plan_key
+    session["step"] = "await_payment_proof"
+
     bot.edit_message_text(
-        f" आपने {plan['name']} को चुना है।\n"
-        "لتفعيل الاشتراك، يرجى التواصل مع الأدمن.",
+        f"✅ تم اختيار الباقة: <b>{plan['name']}</b>\n\n"
+        "💳 <b>طريقة الدفع المتاحة:</b>\n"
+        f"• Payeer: <code>{PAYEER_ACCOUNT}</code>\n\n"
+        "📸 بعد إرسال المبلغ، قم بإرسال لقطة شاشة لإشعار الدفع هنا ليتم مراجعتها وتفعيل اشتراكك.",
         chat_id,
         call.message.message_id,
     )
@@ -497,12 +589,21 @@ def handle_plan_selection(call):
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
 def handle_back_to_main(call):
     chat_id = call.message.chat.id
-    bot.delete_message(chat_id, call.message.message_id)
-    handle_start(call.message)
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception:
+        pass
+    dummy_message = call.message
+    dummy_message.text = "/start"
+    handle_start(dummy_message)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
 def handle_admin_actions(call):
     chat_id = call.message.chat.id
+    if not is_admin(chat_id):
+        bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
+        return
+
     action = call.data.split("_", 1)[1]
 
     if action == "stats":
@@ -532,98 +633,77 @@ def handle_admin_actions(call):
             call.message.message_id,
         )
 
-@bot.message_handler(content_types=['text'])
-def handle_text(message):
-    chat_id = message.chat.id
-    session = user_sessions.get(chat_id)
-
-    if not session:
-        handle_start(message)
+# ================ كولباكات الدفع (تفعيل/رفض من الأدمن) ================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("payok|") or call.data.startswith("payno|"))
+def handle_payment_decision(call):
+    chat_id = call.message.chat.id
+    if not is_admin(chat_id):
+        bot.answer_callback_query(call.id, "هذه الأزرار خاصة بالإدارة.", show_alert=True)
         return
 
-    step = session.get("step")
+    try:
+        action, user_id_str, plan_key = call.data.split("|", 2)
+        target_id = int(user_id_str)
+    except Exception:
+        bot.answer_callback_query(call.id, "بيانات الطلب غير صالحة.", show_alert=True)
+        return
 
-    if step == "await_url":
-        url = extract_url(message.text)
-        if not url:
-            bot.send_message(chat_id, "⚠️ لم أجد رابطاً في رسالتك. أرسل رابط يوتيوب صالح.")
-            return
-        
-        session["url"] = url
-        session["step"] = "await_start_time"
-        bot.send_message(chat_id, "⏰ الآن أرسل وقت بداية المقطع (مثال: 1:25).")
+    plan = PLANS.get(plan_key)
+    if not plan:
+        bot.answer_callback_query(call.id, "الباقة غير معروفة.", show_alert=True)
+        return
 
-    elif step == "await_start_time":
+    if action == "payok":
+        # تفعيل الاشتراك
+        set_subscription(target_id, plan_key)
+        status = subscription_status_text(target_id)
+
+        # رسالة للمستخدم
         try:
-            start_seconds = parse_time_to_seconds(message.text)
-            session["start"] = start_seconds
-            session["step"] = "await_end_time"
-            bot.send_message(chat_id, "⏰ والآن أرسل وقت نهاية المقطع (مثال: 2:40).")
-        except ValueError:
-            bot.send_message(chat_id, "⚠️ صيغة الوقت غير صحيحة. أرسلها على شكل دقائق:ثواني (مثال: 1:25).")
+            bot.send_message(
+                target_id,
+                "✅ تم تفعيل اشتراكك بنجاح.\n\n" + status
+            )
+        except Exception:
+            pass
 
-    elif step == "await_end_time":
+        # تعديل رسالة الأدمن
         try:
-            end_seconds = parse_time_to_seconds(message.text)
-            start_seconds = session.get("start", 0)
-            if end_seconds <= start_seconds:
-                bot.send_message(chat_id, "⚠️ وقت النهاية يجب أن يكون بعد وقت البداية.")
-                return
-            
-            session["end"] = end_seconds
-            session["duration"] = end_seconds - start_seconds
-            session["step"] = "await_quality"
+            bot.edit_message_caption(
+                caption=(call.message.caption or "") + "\n\n✅ <b>تم تفعيل الاشتراك لهذا المستخدم.</b>",
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                reply_markup=None
+            )
+        except Exception:
+            pass
 
-            qualities = get_available_qualities(session["url"])
-            if not qualities:
-                bot.send_message(chat_id, "⚠️ لم أجد أي جودات صالحة. سيتم استخدام جودة 360p افتراضياً.")
-                session["quality_height"] = 360
-                session["step"] = "await_mode"
-                bot.send_message(chat_id, "🎬 اختر نوع الملف:", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("فيديو 📹", callback_data="mode_video"), InlineKeyboardButton("صوت 🎵", callback_data="mode_audio")))
-                return
+        bot.answer_callback_query(call.id, "تم تفعيل الاشتراك 👍")
 
-            markup = InlineKeyboardMarkup()
-            for q in qualities:
-                markup.add(InlineKeyboardButton(f"{q}p", callback_data=f"quality_{q}"))
-            bot.send_message(chat_id, "اختر الجودة المطلوبة:", reply_markup=markup)
-
-        except ValueError:
-            bot.send_message(chat_id, "⚠️ صيغة الوقت غير صحيحة. أرسلها على شكل دقائق:ثواني (مثال: 2:40).")
-
-    elif step == "admin_await_rem_sub_id" and is_admin(chat_id):
+    elif action == "payno":
+        # رفض الطلب
         try:
-            target_id = int(message.text)
-            clear_subscription(target_id)
-            bot.send_message(chat_id, f"✅ تم إزالة اشتراك المستخدم {target_id}.")
-            reset_session(chat_id)
-        except ValueError:
-            bot.send_message(chat_id, "⚠️ ID غير صالح.")
+            bot.send_message(
+                target_id,
+                "❌ تم رفض طلب الاشتراك.\n"
+                "إن كنت تعتقد أن هذا خطأ، تواصل مع الإدارة."
+            )
+        except Exception:
+            pass
 
-    elif chat_id in user_sessions and user_sessions[chat_id].get("admin_chosen_plan") and is_admin(chat_id):
         try:
-            target_id = int(message.text)
-            plan_key = user_sessions[chat_id]["admin_chosen_plan"]
-            set_subscription(target_id, plan_key)
-            bot.send_message(chat_id, f"✅ تم تفعيل اشتراك {PLANS[plan_key]['name']} للمستخدم {target_id}.")
-            reset_session(chat_id)
-        except ValueError:
-            bot.send_message(chat_id, "⚠️ ID غير صالح.")
+            bot.edit_message_caption(
+                caption=(call.message.caption or "") + "\n\n❌ <b>تم رفض هذا الطلب.</b>",
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                reply_markup=None
+            )
+        except Exception:
+            pass
 
-    elif step == "admin_await_broadcast_msg" and is_admin(chat_id):
-        db = load_db()
-        users = db.get("users", {})
-        sent_count = 0
-        failed_count = 0
-        bot.send_message(chat_id, f"📢 جاري إرسال الرسالة إلى {len(users)} مستخدم...")
-        for uid in users.keys():
-            try:
-                bot.send_message(int(uid), message.text)
-                sent_count += 1
-            except Exception:
-                failed_count += 1
-        bot.send_message(chat_id, f"✅ تم الإرسال.\n- نجح: {sent_count}\n- فشل: {failed_count}")
-        reset_session(chat_id)
+        bot.answer_callback_query(call.id, "تم رفض الطلب.")
 
+# ================ كولباك الجودات وأنواع الملفات ================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("quality_"))
 def handle_quality_selection(call):
     chat_id = call.message.chat.id
@@ -634,7 +714,19 @@ def handle_quality_selection(call):
     quality = int(call.data.split("_")[1])
     session["quality_height"] = quality
     session["step"] = "await_mode"
-    bot.edit_message_text("🎬 اختر نوع الملف:", chat_id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("فيديو 📹", callback_data="mode_video"), InlineKeyboardButton("صوت 🎵", callback_data="mode_audio")))
+
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("فيديو 📹", callback_data="mode_video"),
+        InlineKeyboardButton("صوت 🎵", callback_data="mode_audio"),
+    )
+
+    bot.edit_message_text(
+        "🎬 اختر نوع الملف:",
+        chat_id,
+        call.message.message_id,
+        reply_markup=markup
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def handle_mode_selection(call):
@@ -649,6 +741,144 @@ def handle_mode_selection(call):
     bot.edit_message_text("⏳ طلبك قيد المعالجة...", chat_id, call.message.message_id)
     start_cutting(chat_id)
 
+# ================ معالج النصوص العام ================
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    chat_id = message.chat.id
+    text = message.text.strip()
+
+    # تجاهل بعض الأزرار لأنها لها هاندلر خاص
+    if text in ["✂️ قص مقطع يوتيوب", "📦 الاشتراكات", "⚙️ الإعدادات", "🛠 لوحة التحكم"]:
+        return  # الهاندلر الخاص بها عالجها
+
+    session = user_sessions.get(chat_id)
+    if not session:
+        handle_start(message)
+        return
+
+    step = session.get("step")
+
+    # إدخالات الأدمن الخاصة
+    if is_admin(chat_id):
+        if step == "admin_await_rem_sub_id":
+            try:
+                target_id = int(text)
+                clear_subscription(target_id)
+                bot.send_message(chat_id, f"✅ تم إزالة اشتراك المستخدم {target_id}.")
+                reset_session(chat_id)
+            except ValueError:
+                bot.send_message(chat_id, "⚠️ ID غير صالح.")
+            return
+
+        if step == "admin_await_user_id_for_plan" and session.get("admin_chosen_plan"):
+            try:
+                target_id = int(text)
+                plan_key = session["admin_chosen_plan"]
+                set_subscription(target_id, plan_key)
+                bot.send_message(
+                    chat_id,
+                    f"✅ تم تفعيل اشتراك <b>{PLANS[plan_key]['name']}</b> للمستخدم ID: <code>{target_id}</code>."
+                )
+                try:
+                    status = subscription_status_text(target_id)
+                    bot.send_message(
+                        target_id,
+                        "✅ تم تفعيل اشتراكك من قبل الإدارة.\n\n" + status
+                    )
+                except Exception:
+                    pass
+                reset_session(chat_id)
+            except ValueError:
+                bot.send_message(chat_id, "⚠️ ID غير صالح.")
+            return
+
+        if step == "admin_await_broadcast_msg":
+            db = load_db()
+            users = db.get("users", {})
+            sent_count = 0
+            failed_count = 0
+            bot.send_message(chat_id, f"📢 جاري إرسال الرسالة إلى {len(users)} مستخدم...")
+            for uid in users.keys():
+                try:
+                    bot.send_message(int(uid), text)
+                    sent_count += 1
+                except Exception:
+                    failed_count += 1
+            bot.send_message(chat_id, f"✅ تم الإرسال.\n- نجح: {sent_count}\n- فشل: {failed_count}")
+            reset_session(chat_id)
+            return
+
+    # خطوات القص
+    if step == "await_url":
+        url = extract_url(text)
+        if not url:
+            bot.send_message(chat_id, "⚠️ لم أجد رابطاً في رسالتك. أرسل رابط يوتيوب صالح.")
+            return
+
+        session["url"] = url
+        session["step"] = "await_start_time"
+        bot.send_message(chat_id, "⏰ الآن أرسل وقت بداية المقطع (مثال: 1:25).")
+
+    elif step == "await_start_time":
+        try:
+            start_seconds = parse_time_to_seconds(text)
+            session["start"] = start_seconds
+            session["step"] = "await_end_time"
+            bot.send_message(chat_id, "⏰ والآن أرسل وقت نهاية المقطع (مثال: 2:40).")
+        except ValueError:
+            bot.send_message(chat_id, "⚠️ صيغة الوقت غير صحيحة. أرسلها على شكل دقائق:ثواني (مثال: 1:25).")
+
+    elif step == "await_end_time":
+        try:
+            end_seconds = parse_time_to_seconds(text)
+            start_seconds = session.get("start", 0)
+            if end_seconds <= start_seconds:
+                bot.send_message(chat_id, "⚠️ وقت النهاية يجب أن يكون بعد وقت البداية.")
+                return
+
+            session["end"] = end_seconds
+            session["duration"] = end_seconds - start_seconds
+            session["step"] = "await_quality"
+
+            qualities = get_available_qualities(session["url"])
+            if not qualities:
+                bot.send_message(
+                    chat_id,
+                    "⚠️ لم أجد أي جودات صالحة.\n"
+                    "سيتم استخدام جودة 360p افتراضياً."
+                )
+                session["quality_height"] = 360
+                session["step"] = "await_mode"
+                markup = InlineKeyboardMarkup()
+                markup.add(
+                    InlineKeyboardButton("فيديو 📹", callback_data="mode_video"),
+                    InlineKeyboardButton("صوت 🎵", callback_data="mode_audio"),
+                )
+                bot.send_message(chat_id, "🎬 اختر نوع الملف:", reply_markup=markup)
+                return
+
+            markup = InlineKeyboardMarkup()
+            for q in qualities:
+                markup.add(InlineKeyboardButton(f"{q}p", callback_data=f"quality_{q}"))
+
+            bot.send_message(
+                chat_id,
+                "🎛️ اختر الجودة المطلوبة:",
+                reply_markup=markup,
+            )
+
+        except ValueError:
+            bot.send_message(chat_id, "⚠️ صيغة الوقت غير صحيحة. أرسلها على شكل دقائق:ثواني (مثال: 2:40).")
+
+    else:
+        # أي نص آخر بينما الخطوة مختلفة
+        bot.send_message(
+            chat_id,
+            "ℹ️ إن أردت قص مقطع جديد:\n"
+            "اضغط على زر <b>✂️ قص مقطع يوتيوب</b> من القائمة."
+        )
+
+# ================ القص المباشر بالفيديو/الصوت ================
 def start_cutting(chat_id: int):
     session = user_sessions.get(chat_id)
     if not session:
@@ -677,43 +907,69 @@ def start_cutting(chat_id: int):
 
     try:
         if mode == "video":
-            bot.send_message(chat_id, "🔍 جاري تحليل رابط الفيديو للحصول على روابط البث المباشر...")
-            
+            bot.send_message(chat_id, "🔍 جاري تحليل رابط الفيديو للحصول على بث مباشر للجودة المطلوبة...")
+
             try:
                 ydl_opts = {
                     'quiet': True,
                     'skip_download': True,
                     'force_generic_extractor': True,
-                    'format': f'bestvideo[height<={quality_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality_height}][ext=mp4]/best',
+                    'format': f'bestvideo[height<={quality_height}][ext=mp4]+bestaudio[ext=m4a]/'
+                              f'best[height<={quality_height}][ext=mp4]/best',
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info_dict = ydl.extract_info(url, download=False)
-                    
+                    if not info_dict:
+                        raise RuntimeError("تعذر الحصول على معلومات الفيديو من يوتيوب.")
+
                     video_url_stream = None
                     audio_url_stream = None
-                    
-                    best_combined = ydl.get_format_info(info_dict, f'best[height<={quality_height}][ext=mp4]/best')
+
+                    # محاولة الحصول على فورمات مدمج
+                    try:
+                        best_combined = ydl.get_format_info(
+                            info_dict,
+                            f'best[height<={quality_height}][ext=mp4]/best'
+                        )
+                    except Exception:
+                        best_combined = None
+
                     if best_combined and best_combined.get('url'):
                         video_url_stream = best_combined['url']
                         audio_url_stream = None
                     else:
-                        best_video = ydl.get_format_info(info_dict, f'bestvideo[height<={quality_height}][ext=mp4]')
-                        best_audio = ydl.get_format_info(info_dict, 'bestaudio[ext=m4a]')
-                        
+                        # نحاول فيديو وصوت منفصلين
+                        try:
+                            best_video = ydl.get_format_info(
+                                info_dict,
+                                f'bestvideo[height<={quality_height}][ext=mp4]'
+                            )
+                        except Exception:
+                            best_video = None
+                        try:
+                            best_audio = ydl.get_format_info(
+                                info_dict,
+                                'bestaudio[ext=m4a]'
+                            )
+                        except Exception:
+                            best_audio = None
+
                         if best_video and best_video.get('url'):
                             video_url_stream = best_video['url']
                         if best_audio and best_audio.get('url'):
                             audio_url_stream = best_audio['url']
-                            
+
                     if not video_url_stream:
-                        raise RuntimeError("لم يتم العثور على رابط بث مباشر للفيديو بالجودة المطلوبة.")
-                    
+                        raise RuntimeError("لم يتم العثور على رابط بث للفيديو بالجودة المطلوبة.")
+
             except DownloadError as e:
                 raise RuntimeError(f"فشل في تحليل رابط الفيديو: {e}")
-            
+            except Exception as e:
+                raise RuntimeError(f"خطأ أثناء تحليل معلومات الفيديو: {e}")
+
             temp_cut_name = f"cut_full_{chat_id}_{int(time.time())}.mp4"
             cut_file = temp_cut_name
-            
+
             command = [
                 "ffmpeg",
                 "-y",
@@ -722,13 +978,13 @@ def start_cutting(chat_id: int):
                 "-i",
                 video_url_stream,
             ]
-            
+
             if audio_url_stream:
                 command.extend(["-i", audio_url_stream])
                 command.extend(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac"])
             else:
                 command.extend(["-c", "copy"])
-                
+
             command.extend([
                 "-t",
                 str(duration),
@@ -736,19 +992,19 @@ def start_cutting(chat_id: int):
                 "mp4",
                 cut_file,
             ])
-            
+
             bot.send_message(chat_id, "✂️ جاري القص المباشر للمقطع... (قد يستغرق وقتاً)")
-            
+
             result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
+
             if result.returncode != 0:
-                error_output = result.stderr.decode("utf-8")
+                error_output = result.stderr.decode("utf-8", errors="ignore")
                 logger.error("FFmpeg stream cutting failed: %s", error_output)
-                raise RuntimeError(f"فشل في القص المباشر باستخدام FFmpeg: {error_output}")
-                
+                raise RuntimeError(f"فشل في القص المباشر باستخدام FFmpeg.")
+
             if not os.path.exists(cut_file) or os.path.getsize(cut_file) == 0:
                 raise RuntimeError("ملف الفيديو المقصوص فارغ أو غير موجود.")
-                
+
             logger.info("Stream cut file created: %s", cut_file)
 
             parts = split_video_to_parts(cut_file, max_mb=MAX_TELEGRAM_MB)
@@ -788,7 +1044,7 @@ def start_cutting(chat_id: int):
         elif mode == "audio":
             temp_audio_name = f"cut_audio_{chat_id}_{int(time.time())}.m4a"
             audio_file = temp_audio_name
-            
+
             command = [
                 "ffmpeg",
                 "-y",
@@ -805,17 +1061,17 @@ def start_cutting(chat_id: int):
                 "mp4",
                 audio_file,
             ]
-            
+
             bot.send_message(chat_id, "🎧 جاري القص المباشر للمقطع الصوتي...")
-            
+
             result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
+
             if result.returncode != 0:
-                error_output = result.stderr.decode("utf-8")
+                error_output = result.stderr.decode("utf-8", errors="ignore")
                 logger.error("FFmpeg stream cutting audio failed: %s", error_output)
-                bot.send_message(chat_id, f"❌ فشل في القص المباشر للصوت: {error_output}")
+                bot.send_message(chat_id, f"❌ فشل في القص المباشر للصوت.")
                 return
-                
+
             if not os.path.exists(audio_file) or os.path.getsize(audio_file) == 0:
                 bot.send_message(chat_id, "❌ ملف الصوت المقصوص فارغ أو غير موجود.")
                 return
@@ -854,10 +1110,10 @@ def start_cutting(chat_id: int):
         except Exception:
             pass
 
+# ================ تشغيل البوت ================
 if __name__ == "__main__":
     logger.info("🔥 Bot is running…")
     try:
         bot.polling(none_stop=True)
     except Exception as e:
         logger.critical("Bot polling failed: %s", e)
-'''
