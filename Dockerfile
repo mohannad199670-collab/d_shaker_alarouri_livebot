@@ -1,17 +1,25 @@
-# هذا هو الجزء العلوي من ملف Dockerfile الخاص بك
 FROM python:3.11-slim
 
-# ... (الخطوات الأخرى مثل COPY و WORKDIR)
-
-# تثبيت Node.js (وهو ما يوفر بيئة تشغيل JavaScript)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# تثبيت الأدوات الأساسية
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
     curl \
-    # إضافة Node.js و npm
     nodejs \
-    npm && \
-    # تنظيف الكاش لتقليل حجم الصورة النهائية
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    npm \
+    && rm -rf /var/lib/apt/lists/*
 
-# ... (بقية خطوات تثبيت المتطلبات وتشغيل الروبوت)
+# تحديث yt-dlp
+RUN pip install --upgrade yt-dlp
+
+# تثبيت المكتبات
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# نسخ الكود
+COPY . .
+
+# تعريف JS runtime لـ yt-dlp
+ENV YTDLP_JS_RUNTIME=node
+
+CMD ["python", "bot.py"]
