@@ -1,12 +1,21 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y ffmpeg
+# تثبيت ffmpeg + أدوات
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    unzip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# تثبيت deno (JavaScript runtime)
+RUN curl -fsSL https://deno.land/install.sh | sh
+
+# إضافة deno للـ PATH
+ENV PATH="/root/.deno/bin:${PATH}"
 
 WORKDIR /app
-
-COPY requirements.txt requirements.txt
+COPY . .
 RUN pip install -r requirements.txt
 
-COPY . .
-
-CMD [ "python3", "main.py" ]
+CMD ["python", "bot.py"]
