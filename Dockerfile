@@ -1,19 +1,25 @@
 FROM python:3.11-slim
 
-# تثبيت ffmpeg + ffprobe
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# تثبيت الأدوات الأساسية
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    nodejs \
+    npm \
+    && rm -rf /var/lib/apt/lists/*
 
-# مجلد العمل
+# تحديث yt-dlp
+RUN pip install --upgrade yt-dlp
+
+# تثبيت المكتبات
 WORKDIR /app
-
-# نسخ الملفات
-COPY . .
-
-# تثبيت مكتبات بايثون
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# تشغيل البوت
+# نسخ الكود
+COPY . .
+
+# تعريف JS runtime لـ yt-dlp
+ENV YTDLP_JS_RUNTIME=node
+
 CMD ["python", "bot.py"]
