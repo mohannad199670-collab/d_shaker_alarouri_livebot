@@ -1,0 +1,74 @@
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+
+TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+ADMIN_ID = 123456789  # ضع ID الأدمن
+
+users = {}
+
+def start(update: Update, context: CallbackContext):
+    user = update.effective_user
+
+    users[user.id] = {
+        "name": user.full_name,
+        "username": user.username,
+        "language": user.language_code
+    }
+
+    info = (
+        f"👤 مستخدم جديد دخل البوت\n"
+        f"الاسم: {user.full_name}\n"
+        f"اليوزر: @{user.username}\n"
+        f"ID: {user.id}\n"
+        f"اللغة: {user.language_code}"
+    )
+
+    context.bot.send_message(chat_id=ADMIN_ID, text=info)
+    update.message.reply_text("أهلاً بك 👋\nأرسل شكواك وسيتم الرد عليك قريبًا.")
+
+def receive_complaint(update: Update, context: CallbackContext):
+    user = update.effective_user
+    text = update.message.text
+
+    message = (
+        f"📩 شكوى جديدة\n\n"
+        f"👤 الاسم: {user.full_name}\n"
+        f"🆔 ID: {user.id}\n"
+        f"👤 يوزر: @{user.username}\n\n"
+        f"📝 الشكوى:\n{text}"
+    )
+
+    context.bot.send_message(chat_id=ADMIN_ID, text=message)
+    update.message.reply_text("✅ تم استلام شكواك، سيتم الرد عليك قريبًا.")
+
+def reply_to_user(update: Update, context: CallbackContext):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    try:
+        user_id = int(context.args[0])
+        reply_text = " ".join(context.args[1:])
+
+        context.bot.send_message(
+            chat_id=user_id,
+            text=f"📢 رد الإدارة:\n{reply_text}"
+        )
+
+        update.message.reply_text("✅ تم إرسال الرد بنجاح")
+
+    except:
+        update.message.reply_text("❌ الصيغة الصحيحة:\n/reply USER_ID الرسالة")
+
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("reply", reply_to_user))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, receive_complaint))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
