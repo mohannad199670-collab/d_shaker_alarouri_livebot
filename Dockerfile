@@ -1,21 +1,19 @@
 FROM python:3.11-slim
 
-# تثبيت ffmpeg + أدوات
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    curl \
-    unzip \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# تثبيت ffmpeg + ffprobe
+RUN apt-get update && \
+    apt-get install -y ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# تثبيت deno (JavaScript runtime)
-RUN curl -fsSL https://deno.land/install.sh | sh
-
-# إضافة deno للـ PATH
-ENV PATH="/root/.deno/bin:${PATH}"
-
+# مجلد العمل
 WORKDIR /app
-COPY . .
-RUN pip install -r requirements.txt
 
+# نسخ الملفات
+COPY . .
+
+# تثبيت مكتبات بايثون
+RUN pip install --no-cache-dir -r requirements.txt
+
+# تشغيل البوت
 CMD ["python", "bot.py"]
